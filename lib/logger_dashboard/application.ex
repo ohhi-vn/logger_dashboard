@@ -7,6 +7,8 @@ defmodule LoggerDashboard.Application do
 
   @impl true
   def start(_type, _args) do
+    LoggerDashboard.DashboardAuth.announce_boot_token()
+
     children = [
       LoggerDashboardWeb.Telemetry,
       LoggerDashboard.Repo,

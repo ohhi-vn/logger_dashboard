@@ -1,0 +1,8 @@
+#!/bin/sh
+# Applies the ClickHouse DDL that `clickhouse_ex_logger` owns. Releases have no
+# Mix, so this wraps the dependency's own entry point instead of
+# `mix clickhouse_ex_logger.migrate`. The migration is idempotent.
+set -eu
+
+cd -P -- "$(dirname -- "$0")"
+exec ./logger_dashboard eval "ClickhouseExLogger.Utils.migrate()"

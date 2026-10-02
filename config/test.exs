@@ -45,3 +45,7 @@ config :phoenix_live_view,
 # Sort query params output of verified routes for robust url comparisons
 config :phoenix,
   sort_verified_routes_query_params: true
+
+# Shared-token gate default for tests. ConnCase authenticates with this
+# value; unauthenticated paths build a fresh conn without the header.
+config :logger_dashboard, :dashboard_auth_token, "test-token"

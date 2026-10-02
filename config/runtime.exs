@@ -29,6 +29,36 @@ config :clickhouse_ex_logger, ClickhouseExLogger.Repo,
   password: System.get_env("CLICKHOUSE_PASSWORD", ""),
   database: System.get_env("CLICKHOUSE_DATABASE", "logger_dashboard_dev")
 
+# Dashboard shared-token gate. Predefined via DASHBOARD_AUTH_TOKEN, else a
+# boot-generated ephemeral token (in memory only, rotates on restart).
+# Existing app-env value (e.g. config/test.exs) wins when no env is set.
+env_token =
+  case System.get_env("DASHBOARD_AUTH_TOKEN") do
+    nil ->
+      nil
+
+    value ->
+      case String.trim(value) do
+        "" -> nil
+        trimmed -> trimmed
+      end
+  end
+
+cond do
+  not is_nil(env_token) ->
+    Application.put_env(:logger_dashboard, :dashboard_auth_token, env_token)
+
+  not is_nil(Application.get_env(:logger_dashboard, :dashboard_auth_token)) ->
+    :ok
+
+  true ->
+    token = :crypto.strong_rand_bytes(24) |> Base.url_encode64(padding: false)
+    Application.put_env(:logger_dashboard, :dashboard_auth_token, token)
+    # The flag, not a log line here: in a release this file is evaluated before
+    # :logger starts, so anything logged from here is dropped.
+    Application.put_env(:logger_dashboard, :dashboard_auth_token_generated, true)
+end
+
 if config_env() == :dev do
   # Reload browser tabs when matching files change.
   config :logger_dashboard, LoggerDashboardWeb.Endpoint,

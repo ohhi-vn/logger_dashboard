@@ -52,6 +52,8 @@ defmodule LoggerDashboardWeb do
     quote do
       use Phoenix.LiveView
 
+      on_mount LoggerDashboardWeb.Plugs.DashboardAuth
+
       unquote(html_helpers())
     end
   end

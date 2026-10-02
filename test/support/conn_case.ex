@@ -33,6 +33,16 @@ defmodule LoggerDashboardWeb.ConnCase do
 
   setup tags do
     LoggerDashboard.DataCase.setup_sandbox(tags)
-    {:ok, conn: Phoenix.ConnTest.build_conn()}
+
+    token =
+      LoggerDashboard.DashboardAuth.get_token() || "test-token"
+
+    Application.put_env(:logger_dashboard, :dashboard_auth_token, token)
+
+    conn =
+      Phoenix.ConnTest.build_conn()
+      |> Plug.Conn.put_req_header("authorization", "Bearer #{token}")
+
+    {:ok, conn: conn}
   end
 end
