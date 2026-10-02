@@ -11,7 +11,6 @@ defmodule LoggerDashboard.Application do
 
     children = [
       LoggerDashboardWeb.Telemetry,
-      LoggerDashboard.Repo,
       ClickhouseExLogger.Repo,
       {DNSCluster, query: Application.get_env(:logger_dashboard, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: LoggerDashboard.PubSub},

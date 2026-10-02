@@ -15,6 +15,8 @@ To start your Phoenix server:
 
 Now you can visit [`localhost:4000`](http://localhost:4000) from your browser.
 
+For a full deployment — dashboard plus ClickHouse in one command — see [Deployment](#deployment).
+
 ## Authentication
 
 Every route (`/`, `/logs`, `/analysis`, `/prune`) is behind one shared token. There are no user accounts: anyone with the token can prune.
@@ -45,7 +47,64 @@ A browser gets a `401` with a `WWW-Authenticate: Basic` challenge, so it prompts
 
 Tokens are compared in constant time and are never logged except for that one boot line.
 
+## Deployment
+
+The stack is two services — the dashboard and a single-node ClickHouse. Nothing
+else is required.
+
+Prerequisites: Podman with Podman Compose (or Docker with Compose v2).
+
+```bash
+cp .env.example .env      # then fill in the three required secrets
+chmod 600 .env
+podman compose up --build
+```
+
+The dashboard is then on <http://localhost:4000> (`docker compose up --build`
+works identically). Required secrets, and how to generate them:
+
+| Variable | Generate with |
+| --- | --- |
+| `SECRET_KEY_BASE` | `mix phx.gen.secret` |
+| `DASHBOARD_AUTH_TOKEN` | `mix logger_dashboard.gen.token` |
+| `CLICKHOUSE_PASSWORD` | `openssl rand -hex 24` |
+
+`podman compose up` aborts naming any missing variable before it creates a
+container, so a stack never starts with a default or empty secret. Keep the
+password free of `/ : @ ? # & %` and whitespace — it travels in the dashboard's
+ClickHouse URL (see [Configuration](#configuration)), and hex output has none of
+those characters.
+
+Common commands:
+
+```bash
+podman compose ps             # service and health state
+podman compose logs -f dashboard
+podman compose down           # stop; log rows are kept
+podman compose down --volumes # stop and DELETE all stored logs
+```
+
+`down --volumes` destroys the ClickHouse data volume. The next `up` recreates the
+schema automatically, so the dashboard comes back empty but working.
+
+Notes and caveats:
+
+- **ClickHouse ports are loopback-only.** `8123` and `9000` bind to `127.0.0.1`
+  so they are not reachable from another host. To let a remote node ship logs
+  into it, publish the port on a private interface in `compose.yaml` and
+  firewall it.
+- **Plain HTTP on loopback only.** The release's `force_ssl` exempts just
+  `localhost` and `127.0.0.1`; any other hostname over plain HTTP is redirected
+  to HTTPS. Terminate TLS in front of the published port for remote access —
+  the stack itself serves no TLS.
+- **Single node, no replication.** All logs live in one local volume.
+- **Pointing at an existing ClickHouse instead** works too: drop the `clickhouse`
+  service from `compose.yaml` and set `CLICKHOUSE_URL` on the dashboard to your
+  instance.
+
 ## Container image
+
+To run the image without compose:
 
 ```bash
 podman build -t logger-dashboard:latest .          # add --format docker for the HEALTHCHECK
@@ -53,22 +112,22 @@ docker build  -t logger-dashboard:latest .
 
 podman run -d --name logger_dashboard -p 4000:4000 \
   -e SECRET_KEY_BASE="$(mix phx.gen.secret)" \
-  -e DATABASE_URL=ecto://postgres:postgres@clickhouse:5432/logger_dashboard_prod \
   -e PHX_HOST=dashboard.example.com \
   -e CLICKHOUSE_URL=http://clickhouse:8123 \
-  -e CLICKHOUSE_USER=default \
-  -e CLICKHOUSE_PASSWORD=secret \
   -e DASHBOARD_AUTH_TOKEN="$(mix logger_dashboard.gen.token)" \
   logger-dashboard:latest
 ```
 
-The image runs as `nobody`, listens on `$PORT` (default `4000`), and needs no Elixir or Node at runtime. `SECRET_KEY_BASE` and `DATABASE_URL` are required in prod — the boot fails naming whichever is missing.
+The image runs as `nobody`, listens on `$PORT` (default `4000`), and needs no
+Elixir or Node at runtime. `SECRET_KEY_BASE` is the only variable required in
+prod — the boot fails naming it when missing. There is no other database: the
+dashboard reads only ClickHouse.
 
 Apply the ClickHouse DDL before the first start (the image has no Mix):
 
 ```bash
 podman run --rm --network clickhouse \
-  -e SECRET_KEY_BASE=... -e DATABASE_URL=... -e CLICKHOUSE_URL=... \
+  -e SECRET_KEY_BASE=... -e CLICKHOUSE_URL=... \
   logger-dashboard:latest /app/bin/migrate
 ```
 
@@ -108,12 +167,23 @@ requires `--allow-prod`.
 | `PORT` | `4000` | HTTP port. |
 | `PHX_HOST` | `example.com` | Public host used for generated URLs. |
 | `SECRET_KEY_BASE` | — | **Required in prod.** Raises at boot when unset. |
-| `DATABASE_URL` | — | **Required in prod.** Raises at boot when unset. |
-| `POOL_SIZE` | `10` | Postgres pool size. |
-| `CLICKHOUSE_URL` | `http://localhost:8123` | |
-| `CLICKHOUSE_USER` | `default` | |
-| `CLICKHOUSE_PASSWORD` | empty | |
+| `CLICKHOUSE_URL` | `http://localhost:8123` | Service URL, e.g. `http://clickhouse:8123`. |
+| `CLICKHOUSE_USER` | `default` | See the note below — not forwarded to the client. |
+| `CLICKHOUSE_PASSWORD` | empty | See the note below — not forwarded to the client. |
 | `CLICKHOUSE_DATABASE` | `logger_dashboard_dev` | |
+
+For a ClickHouse that requires authentication, put the credentials in the
+URL's userinfo:
+
+```
+CLICKHOUSE_URL=http://default:<password>@clickhouse:8123
+```
+
+`CLICKHOUSE_USER` and `CLICKHOUSE_PASSWORD` are read into the repo config but
+are **not** passed on to the HTTP client, which receives only the URL — so on a
+password-protected server they authenticate nothing. This is why the compose
+stack builds the URL with the credentials in it. Prefer a password without
+`/ : @ ? # & %` so the URL stays well-formed.
 
 ```elixir
 # config/runtime.exs (env overrides)
@@ -124,7 +194,10 @@ config :clickhouse_ex_logger, ClickhouseExLogger.Repo,
   database: System.get_env("CLICKHOUSE_DATABASE", "logger_dashboard_dev")
 ```
 
-`ClickhouseExLogger.Repo` is supervised before the Endpoint. Missing configuration raises instead of silently defaulting.
+`ClickhouseExLogger.Repo` is supervised before the Endpoint. Note that a wrong
+host or database fails at query time rather than at boot; only wrong
+credentials against a password-protected server reach it at all if they are in
+the URL.
 
 ## Releases
 
@@ -144,6 +217,7 @@ Then start with `PHX_SERVER=true bin/logger_dashboard start`.
 - **The token is shared, not per-user.** Anyone holding it can prune. Rotate by changing the env var (or restarting with no token).
 - **Serve over TLS.** Basic/Bearer credentials are only base64-encoded. Terminate TLS in front of the container; the plain-HTTP dev setup is not safe on a network.
 - **Message search is in-memory.** `*`/`?` wildcards filter in Elixir over the latest 1,000 ClickHouse-prefiltered rows (node/level/time push down). Tighten the time range for large log volumes.
+- **The ClickHouse password shows up in container metadata.** It travels in the dashboard's URL, so `podman inspect` and `podman compose config` print it. Keep `.env` at `chmod 600`.
 
 ## Learn more
 

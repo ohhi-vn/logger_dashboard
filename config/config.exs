@@ -7,9 +7,7 @@
 # General application configuration
 import Config
 
-config :logger_dashboard,
-  ecto_repos: [LoggerDashboard.Repo],
-  generators: [timestamp_type: :utc_datetime]
+config :logger_dashboard, generators: [timestamp_type: :utc_datetime]
 
 # Configure the endpoint
 config :logger_dashboard, LoggerDashboardWeb.Endpoint,

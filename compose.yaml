@@ -1,0 +1,99 @@
+# Two-service deployment for the log dashboard: the release image plus a
+# single-node ClickHouse. No database, cache, or proxy is needed.
+#
+#   cp .env.example .env   # then fill in the three secrets
+#   podman compose up --build
+#
+# Secrets come from .env (gitignored; .env.example is committed) and are
+# interpolated with :? so a missing value aborts before any container starts.
+# ClickHouse ports are published on loopback only; the dashboard talks to
+# ClickHouse over the compose network by service name.
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.9
+    # No CLICKHOUSE_USER: the full-privilege `default` user is used with a
+    # password, because schema bootstrap issues DDL.
+    environment:
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD in .env}
+      CLICKHOUSE_DB: ${CLICKHOUSE_DATABASE:-logger_dashboard}
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    ports:
+      # Loopback only: for host-local inspection and log producers. Never
+      # publish these on a routable interface without reading the caveats in
+      # README.md first.
+      - "127.0.0.1:8123:8123"
+      - "127.0.0.1:9000:9000"
+    healthcheck:
+      # The same authenticated connection the dashboard makes, so wrong
+      # credentials report unhealthy here instead of surfacing as a failed
+      # schema application. `$$` escapes interpolation so the password comes
+      # from the container's own environment.
+      test:
+        [
+          "CMD-SHELL",
+          "clickhouse-client --host 127.0.0.1 --user default --password \"$$CLICKHOUSE_PASSWORD\" --query 'SELECT 1'"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      # ClickHouse's first boot is slow; don't judge it during that window.
+      start_period: 30s
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: Containerfile
+    command:
+      - /bin/sh
+      - -c
+      - |
+        # `/app/bin/migrate` logs a failed bootstrap but still exits 0, so a
+        # plain `migrate && server` would serve traffic against a store whose
+        # schema never applied. Call the same entry point and halt on error so
+        # a bad password or an unreachable server keeps the service down.
+        /app/bin/logger_dashboard eval '
+        case ClickhouseExLogger.Utils.migrate() do
+          {:ok, _} -> :ok
+          {:error, reason} ->
+            IO.puts(:stderr, "schema bootstrap failed: " <> inspect(reason))
+            System.halt(1)
+        end
+        ' && exec /app/bin/server
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    environment:
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE:?set SECRET_KEY_BASE in .env - generate with mix phx.gen.secret}
+      DASHBOARD_AUTH_TOKEN: ${DASHBOARD_AUTH_TOKEN:?set DASHBOARD_AUTH_TOKEN in .env - generate with mix logger_dashboard.gen.token}
+      PHX_HOST: ${PHX_HOST:-localhost}
+      # The credentials ride in the URL, not in CLICKHOUSE_USER/CLICKHOUSE_PASSWORD:
+      # AshClickhouse.Connection passes only :url through to the HTTP client, so
+      # separate username/password config never reaches the wire and every
+      # request would be rejected by a password-protected server. hackney turns
+      # URL userinfo into basic auth. See .env.example on safe password
+      # characters.
+      CLICKHOUSE_URL: http://default:${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD in .env}@clickhouse:8123
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-logger_dashboard}
+    ports:
+      - "127.0.0.1:${DASHBOARD_PORT:-4000}:4000"
+    healthcheck:
+      # Duplicates the Containerfile probe so `podman compose ps` reports it
+      # even when the image is built in the default OCI format and the
+      # image-level HEALTHCHECK is dropped. 401 is a valid answer: every route
+      # sits behind the shared-token gate.
+      test:
+        [
+          "CMD-SHELL",
+          "curl -s -o /dev/null -w '%{http_code}' http://localhost:4000/logs | grep -qE '^(200|401)$' || exit 1"
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+volumes:
+  clickhouse-data:
