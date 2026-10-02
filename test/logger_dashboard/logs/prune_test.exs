@@ -9,9 +9,64 @@ defmodule LoggerDashboard.Logs.PruneTest do
     assert {:error, _} = Prune.parse(%{"scope" => "node", "node" => ""})
   end
 
-  test "parse accepts all-nodes scope" do
-    assert {:ok, filter, :all} = Prune.parse(%{"scope" => "all"})
-    assert filter.node in [nil, ""]
+  test "parse rejects an absent scope instead of defaulting to whole-system" do
+    assert {:error, message} = Prune.parse(%{})
+    assert message =~ "scope"
+
+    assert {:error, _} = Prune.parse(%{"node" => "a@b"})
+  end
+
+  test "parse accepts all-nodes scope when bounded" do
+    assert {:ok, filter, :all} =
+             Prune.parse(%{"scope" => "all", "from" => "2026-09-01T00:00:00Z"})
+
+    assert filter.nodes == []
+  end
+
+  test "parse rejects a multi-node value for node scope" do
+    # A prune deletes rows and its confirmation names one node. Accepting a
+    # comma-separated value would let the confirmation understate the blast
+    # radius, so the request is rejected rather than narrowed to one node.
+    assert {:error, message} =
+             Prune.parse(%{
+               "scope" => "node",
+               "node" => "a@b,c@d",
+               "from" => "2026-09-01T00:00:00Z"
+             })
+
+    assert message =~ "exactly one node"
+
+    # Duplicates of a single node still resolve to one node.
+    assert {:ok, filter, :node} =
+             Prune.parse(%{
+               "scope" => "node",
+               "node" => "a@b, a@b",
+               "from" => "2026-09-01T00:00:00Z"
+             })
+
+    assert filter.nodes == ["a@b"]
+  end
+
+  test "parse rejects an unbounded prune" do
+    assert {:error, message} = Prune.parse(%{"scope" => "all"})
+    assert message =~ "from"
+    assert message =~ "to"
+
+    assert {:error, _} = Prune.parse(%{"scope" => "node", "node" => "a@b"})
+  end
+
+  test "parse accepts a one-sided range" do
+    assert {:ok, f, :node} =
+             Prune.parse(%{"scope" => "node", "node" => "a@b", "from" => "2026-09-01T00:00:00Z"})
+
+    assert f.from != nil
+    assert f.to == nil
+
+    assert {:ok, f, :node} =
+             Prune.parse(%{"scope" => "node", "node" => "a@b", "to" => "2026-09-02T00:00:00Z"})
+
+    assert f.from == nil
+    assert f.to != nil
   end
 
   test "where_clause only uses validated fields" do
@@ -24,7 +79,7 @@ defmodule LoggerDashboard.Logs.PruneTest do
              })
 
     {sql, params} = Prune.where_clause(filter, :node)
-    assert sql =~ "node = ?"
+    assert sql =~ "node IN (?)"
     assert sql =~ "level = ?"
     assert sql =~ "timestamp >="
     assert length(params) == 3
@@ -67,7 +122,13 @@ defmodule LoggerDashboard.Logs.PruneTest do
     assert {:ok, 2} = ClickhouseExLogger.Insert.insert(rows)
     Process.sleep(2_000)
 
-    assert {:ok, filter, :node} = Prune.parse(%{"scope" => "node", "node" => del})
+    assert {:ok, filter, :node} =
+             Prune.parse(%{
+               "scope" => "node",
+               "node" => del,
+               "from" => DateTime.to_iso8601(DateTime.add(now, -60, :second))
+             })
+
     assert {:ok, message} = Prune.run(filter, :node)
     assert message =~ "asynchronously"
 

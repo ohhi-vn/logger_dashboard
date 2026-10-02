@@ -21,7 +21,7 @@ defmodule LoggerDashboard.Logs.Analysis do
   @spec dyan_filters(Filter.t()) :: map()
   def dyan_filters(%Filter{} = filter) do
     %{}
-    |> maybe_put(:node, filter.node)
+    |> maybe_put_nodes(filter.nodes)
     |> maybe_put_level(filter.level)
     |> maybe_put_range(filter.from, filter.to)
   end
@@ -118,9 +118,12 @@ defmodule LoggerDashboard.Logs.Analysis do
 
   defp normalize_bucket(_), do: @default_bucket
 
-  defp maybe_put(map, _key, nil), do: map
-  defp maybe_put(map, _key, ""), do: map
-  defp maybe_put(map, key, value), do: Map.put(map, key, value)
+  # One selected node still goes through `:in`, so the viewer and the analysis
+  # page share one node-scope representation. `Ash.Query.Operator` in Ash 3.33
+  # exposes `:in`, and `AshClickhouse` builds it as `IN`, so this stays
+  # pushdown-capable rather than falling back to raw SQL.
+  defp maybe_put_nodes(map, []), do: map
+  defp maybe_put_nodes(map, nodes), do: Map.put(map, :node, %{in: nodes})
 
   defp maybe_put_level(map, "all"), do: map
   defp maybe_put_level(map, nil), do: map

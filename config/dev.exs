@@ -26,7 +26,7 @@ config :logger_dashboard, LoggerDashboardWeb.Endpoint,
   secret_key_base: "ap4i/leR7+mVwDhWs0Y0wBgROWRyYVGp/1QTSFrz75t07F5D9ytHf5wi3mbvZyOF",
   watchers: [
     esbuild: {Esbuild, :install_and_run, [:logger_dashboard, ~w(--sourcemap=inline --watch)]},
-    tailwind: {Tailwind, :install_and_run, [:logger_dashboard, ~w(--watch)]}
+    tailwind: {LoggerDashboard.Tailwind, :install_and_run, [:logger_dashboard, ~w(--watch)]}
   ]
 
 # ## SSL Support

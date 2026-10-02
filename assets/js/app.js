@@ -40,6 +40,27 @@ topbar.config({barColors: {0: "#29d"}, shadowColor: "rgba(0, 0, 0, .3)"})
 window.addEventListener("phx:page-loading-start", _info => topbar.show(300))
 window.addEventListener("phx:page-loading-stop", _info => topbar.hide())
 
+// A file pushed by the server. The log viewer builds its export body from the
+// rows it already holds, so there is no request to point an anchor at and no
+// route to add: the browser turns the pushed body into a Blob and downloads it.
+// Pushed events are dispatched on the window with a `phx:` prefix.
+window.addEventListener("phx:logs-download", ({detail}) => {
+  const url = URL.createObjectURL(new Blob([detail.body], {type: detail.content_type}))
+  const link = document.createElement("a")
+
+  // Firefox only honours a click on an anchor that is in the document.
+  link.href = url
+  link.download = detail.filename
+  link.style.display = "none"
+  document.body.appendChild(link)
+  link.click()
+  document.body.removeChild(link)
+
+  // Revoked on the next tick rather than immediately: the download has only
+  // started at this point, and some browsers read the blob asynchronously.
+  setTimeout(() => URL.revokeObjectURL(url), 0)
+})
+
 // connect if there are any LiveViews on the page
 liveSocket.connect()
 

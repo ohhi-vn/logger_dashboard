@@ -1,31 +1,74 @@
 defmodule LoggerDashboard.Logs.Filter do
   @moduledoc """
-  Parses viewer/prune filter params and builds ClickHouse-pushable Ash queries.
+  Parses viewer/analysis/prune filter params and builds the shared SQL
+  predicate set.
 
-  Text search (`*`/`?` wildcards over `message`) is applied in memory because
-  `ash_clickhouse 0.7.3` cannot translate `contains/like` function filters to
-  ClickHouse SQL (it raises `QueryError` for untranslatable filters). Node,
-  level, and timestamp predicates are pushed to ClickHouse.
+  The node scope is a list: the `node` param accepts one or more node names
+  separated by commas, and an empty list means every node. Node, level,
+  timestamp, and message predicates are all emitted as bound parameters by
+  `predicates/1`, consumed by both the raw read path
+  (`LoggerDashboard.Logs.LogRead`) and `LoggerDashboard.Logs.Prune`.
+
+  Wildcard search cannot be pushed down through Ash: `Ash.Query.Operator`
+  in Ash 3.33 exposes no `:like` operator, so the filter is rejected before the
+  data layer is consulted, even though `AshClickhouse` implements the
+  comparison. That is why the read path is raw SQL rather than an Ash query.
   """
 
   @levels ~w(error warning info debug all)
-  @default_limit 50
-  @max_limit 500
-  @search_fetch_limit 1_000
+  @default_limit 100
+  @max_limit 3000
 
-  defstruct node: nil,
+  # The page sizes the viewer's per-page control offers. `@default_limit` is
+  # the first of these, so a URL carrying no `limit` lands on an offered value.
+  #
+  # This is a control vocabulary, not a validation set: `parse_pagination/1`
+  # honours any positive whole number and caps at `@max_limit`, so a size that
+  # is no longer offered but is still reachable from an existing link keeps
+  # working. The control renders the active size alongside these so it can
+  # represent such a link rather than falling back to the default.
+  @page_sizes ["100", "500", "3000"]
+
+  # Relative-range shortcuts, keyed by family and ordered shortest-first.
+  #
+  # A `window` preset is a lookback that ends now, so it sets both bounds. An
+  # `age` preset is a retention cutoff, so it sets only `to` and leaves `from`
+  # open. The families are kept separate rather than merged into one vocabulary
+  # because both readings want a "7d": "last 7 days" and "older than 7 days" are
+  # different ranges, so a bare `7d` would be ambiguous. Preset ids are
+  # therefore namespaced as `"<family>:<id>"` — see `preset_id/2`.
+  @presets %{
+    "window" => [
+      {"10m", {10, :minute}},
+      {"1h", {1, :hour}},
+      {"6h", {6, :hour}},
+      {"24h", {24, :hour}},
+      {"7d", {7, :day}}
+    ],
+    "age" => [
+      {"1d", {1, :day}},
+      {"3d", {3, :day}},
+      {"7d", {7, :day}},
+      {"30d", {30, :day}},
+      {"90d", {90, :day}}
+    ]
+  }
+
+  defstruct nodes: [],
             search: "",
             from: nil,
             to: nil,
+            preset: nil,
             level: "all",
             limit: @default_limit,
             offset: 0
 
   @type t :: %__MODULE__{
-          node: String.t() | nil,
+          nodes: [String.t()],
           search: String.t(),
           from: DateTime.t() | nil,
           to: DateTime.t() | nil,
+          preset: String.t() | nil,
           level: String.t(),
           limit: pos_integer(),
           offset: non_neg_integer()
@@ -34,23 +77,157 @@ defmodule LoggerDashboard.Logs.Filter do
   @doc "Parse string-keyed params into a validated filter."
   @spec parse(map()) :: {:ok, t()} | {:error, String.t()}
   def parse(params) when is_map(params) do
-    with {:ok, node} <- parse_node(params),
-         {:ok, search} <- parse_search(params),
-         {:ok, {from, to}} <- parse_range(params),
+    nodes = parse_nodes(params)
+
+    with {:ok, search} <- parse_search(params),
+         {:ok, preset} <- parse_preset(params),
+         {:ok, {from, to}} <- parse_range(params, preset),
          {:ok, level} <- parse_level(params),
          {:ok, {limit, offset}} <- parse_pagination(params) do
       {:ok,
        %__MODULE__{
-         node: node,
+         nodes: nodes,
          search: search,
          from: from,
          to: to,
+         preset: preset,
          level: level,
          limit: limit,
          offset: offset
        }}
     end
   end
+
+  @doc """
+  The ordered `{"id", {amount, unit}}` list of relative shortcuts in `family`.
+
+  The viewer and Analysis page offer `:window`; the prune page offers `:age`.
+  The web layer renders a button per entry so the shortcut vocabulary has a
+  single owner here rather than being restated in a template.
+  """
+  @spec presets(:window | :age) :: [{String.t(), {pos_integer(), System.time_unit()}}]
+  def presets(family) when family in [:window, :age],
+    do: Map.fetch!(@presets, Atom.to_string(family))
+
+  @doc "Qualify a bare preset id with its family, producing the `preset` param value."
+  @spec preset_id(:window | :age, String.t()) :: String.t()
+  def preset_id(family, id) when family in [:window, :age],
+    do: "#{family}:#{id}"
+
+  @doc """
+  Resolve a `preset` param into concrete `{from, to}` bounds against `now`.
+
+  `now` is a parameter rather than a call to `DateTime.utc_now/0` so resolution
+  is anchored to the request's clock and is testable without stubbing time.
+
+  Resolution happens per request rather than at click time so a URL carrying a
+  shortcut always describes a window ending now: a bookmarked "last hour" link
+  would otherwise pin the instant it was created. A `window` preset resolves to
+  `{now - duration, now}`; an `age` preset resolves to `{nil, now - duration}`,
+  leaving the open end unbounded. An absent or blank preset resolves to
+  `{nil, nil}`, meaning "no range" rather than "an empty one".
+  """
+  @spec resolve_preset(String.t() | nil, DateTime.t()) ::
+          {:ok, {DateTime.t() | nil, DateTime.t() | nil}} | {:error, String.t()}
+  def resolve_preset(preset, now)
+
+  def resolve_preset(nil, _now), do: {:ok, {nil, nil}}
+  def resolve_preset("", _now), do: {:ok, {nil, nil}}
+
+  def resolve_preset(preset, %DateTime{} = now) when is_binary(preset) do
+    case String.trim(preset) do
+      "" -> {:ok, {nil, nil}}
+      trimmed -> split_preset(trimmed, now)
+    end
+  end
+
+  defp split_preset(trimmed, now) do
+    case String.split(trimmed, ":", parts: 2) do
+      [family, id] -> resolve_family_preset(family, id, now)
+      _one_part -> {:error, unknown_preset_error(trimmed)}
+    end
+  end
+
+  defp resolve_family_preset(family, id, now) do
+    with true <- is_map_key(@presets, family),
+         {_, {amount, unit}} <- List.keyfind(Map.fetch!(@presets, family), id, 0) do
+      cutoff = DateTime.add(now, -amount, unit)
+
+      if family == "window", do: {:ok, {cutoff, now}}, else: {:ok, {nil, cutoff}}
+    else
+      _ -> {:error, unknown_preset_error("#{family}:#{id}")}
+    end
+  end
+
+  defp unknown_preset_error(preset),
+    do:
+      "invalid preset #{inspect(preset)}; expected one of #{Enum.map_join(all_preset_ids(), ", ", &inspect/1)}"
+
+  defp all_preset_ids do
+    for family <- Map.keys(@presets),
+        {id, _duration} <- Map.fetch!(@presets, family),
+        do: "#{family}:#{id}"
+  end
+
+  @doc """
+  Render a validated filter back to string-keyed params.
+
+  Used to fill form fields from the parsed filter rather than from raw request
+  params, so the inputs show the values the system actually applied — including
+  the instants a `preset` resolved to, and a `level` or `limit` that was
+  normalized or clamped during parsing.
+  """
+  @spec to_params(t()) :: %{String.t() => String.t()}
+  def to_params(%__MODULE__{} = filter) do
+    %{
+      "node" => nodes_to_param(filter.nodes),
+      "search" => filter.search,
+      "from" => iso8601(filter.from),
+      "to" => iso8601(filter.to),
+      "level" => filter.level,
+      "limit" => Integer.to_string(filter.limit),
+      "offset" => Integer.to_string(filter.offset)
+    }
+    |> put_preset(filter.preset)
+  end
+
+  defp put_preset(params, nil), do: params
+  defp put_preset(params, preset), do: Map.put(params, "preset", preset)
+
+  # Second precision, not the microseconds `DateTime.utc_now/0` carries. A bound
+  # is only ever chosen to minute precision by the picker, so echoing
+  # microseconds would put a value in the field and the URL that the control
+  # that produced it cannot represent.
+  defp iso8601(nil), do: ""
+
+  defp iso8601(%DateTime{} = datetime) do
+    datetime
+    |> DateTime.truncate(:second)
+    |> DateTime.to_iso8601()
+  end
+
+  @doc """
+  Parse the `node` param as a comma-separated list of node names.
+
+  Entries are trimmed and blank entries are dropped, so `"a@h, ,b@h,"` yields
+  `["a@h", "b@h"]`. An input that reduces to nothing yields `[]`, which is the
+  "all nodes" scope. Node names are `name@host` and cannot contain a comma, so
+  splitting is unambiguous.
+  """
+  @spec parse_nodes(map()) :: [String.t()]
+  def parse_nodes(params) do
+    params
+    |> get("node", "")
+    |> to_string()
+    |> String.split(",")
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.uniq()
+  end
+
+  @doc "Render a node list back to its comma-separated form, for display or URL params."
+  @spec nodes_to_param([String.t()]) :: String.t()
+  def nodes_to_param(nodes) when is_list(nodes), do: Enum.join(nodes, ",")
 
   @doc """
   Translate a user wildcard (`*` = any run, `?` = single char) to a
@@ -75,102 +252,91 @@ defmodule LoggerDashboard.Logs.Filter do
     |> Enum.join()
   end
 
-  @doc "Translate a user wildcard to an Elixir regex (case-sensitive)."
-  @spec to_regex(String.t() | nil) :: Regex.t() | nil
-  def to_regex(nil), do: nil
-  def to_regex(""), do: nil
+  @doc """
+  Build the shared `WHERE` clause for a validated filter.
 
-  def to_regex(search) when is_binary(search) do
-    pattern =
-      search
-      |> String.graphemes()
-      |> Enum.map(fn
-        "*" -> ".*"
-        "?" -> "."
-        c -> Regex.escape(c)
-      end)
-      |> Enum.join()
+  Emits `node IN (...)`, `level`, and `timestamp` predicates plus
+  `message LIKE ?` when and only when a search pattern is present. Every value
+  is a bound parameter and no user input reaches the SQL string, so one clause
+  set is safe for both the raw read path and prune. Callers append their own
+  trailing clause (`ORDER BY`/`LIMIT` for reads, nothing for prune).
 
-    Regex.compile!("^#{pattern}$")
-  end
+  An empty node list applies no node predicate, so a filter with no active
+  predicate yields `{"1 = 1", []}`.
+  """
+  @spec predicates(t()) :: {String.t(), list()}
+  def predicates(%__MODULE__{} = filter) do
+    {clauses, params} = {[], []}
 
-  @doc "Filter rows by `message` using the wildcard search (no-op when empty)."
-  @spec apply_message_filter([map()], String.t() | nil) :: [map()]
-  def apply_message_filter(rows, nil), do: rows
-  def apply_message_filter(rows, ""), do: rows
+    {clauses, params} = maybe_push_nodes(clauses, params, filter.nodes)
 
-  def apply_message_filter(rows, search) when is_binary(search) do
-    case to_regex(search) do
-      nil -> rows
-      regex -> Enum.filter(rows, fn row -> Regex.match?(regex, message_of(row)) end)
+    {clauses, params} =
+      if filter.level in [nil, "all", ""],
+        do: {clauses, params},
+        else: maybe_push(clauses, params, "level = ?", filter.level)
+
+    {clauses, params} =
+      if filter.from,
+        do: maybe_push(clauses, params, "timestamp >= ?", filter.from),
+        else: {clauses, params}
+
+    {clauses, params} =
+      if filter.to,
+        do: maybe_push(clauses, params, "timestamp <= ?", filter.to),
+        else: {clauses, params}
+
+    {clauses, params} =
+      maybe_push(clauses, params, "message LIKE ?", to_like_pattern(filter.search))
+
+    case Enum.reverse(clauses) do
+      [] -> {"1 = 1", []}
+      ordered -> {Enum.join(ordered, " AND "), Enum.reverse(params)}
     end
   end
 
-  @doc "Build an Ash query with pushable predicates (node/level/timestamp)."
-  @spec to_query(t(), keyword()) :: Ash.Query.t()
-  def to_query(%__MODULE__{} = filter, opts \\ []) do
-    require Ash.Query
+  defp maybe_push_nodes(clauses, params, []), do: {clauses, params}
 
-    limit = Keyword.get(opts, :limit, filter.limit)
-    offset = Keyword.get(opts, :offset, filter.offset)
+  defp maybe_push_nodes(clauses, params, nodes) do
+    placeholders = Enum.map_join(nodes, ", ", fn _ -> "?" end)
 
-    LoggerDashboard.Logs.LogView
-    |> Ash.Query.sort(timestamp: :desc)
-    |> Ash.Query.limit(limit)
-    |> Ash.Query.offset(offset)
-    |> maybe_filter_node(filter.node)
-    |> maybe_filter_level(filter.level)
-    |> maybe_filter_range(filter.from, filter.to)
+    {["node IN (#{placeholders})" | clauses], Enum.reverse(nodes) ++ params}
   end
 
-  @doc "Fetch rows: pushable filters in ClickHouse, message search in memory."
-  @spec list_logs(t(), keyword()) :: {:ok, [map()]} | {:error, term()}
-  def list_logs(%__MODULE__{search: search} = filter, opts \\ []) do
-    if search in [nil, ""] do
-      query = to_query(filter, opts)
+  defp maybe_push(clauses, params, _clause, nil), do: {clauses, params}
+  defp maybe_push(clauses, params, _clause, ""), do: {clauses, params}
 
-      case Ash.read(query, domain: LoggerDashboard.Logs) do
-        {:ok, rows} -> {:ok, rows}
-        {:error, error} -> {:error, error}
-      end
-    else
-      fetch_limit = Keyword.get(opts, :limit, filter.limit)
-      fetch_offset = Keyword.get(opts, :offset, filter.offset)
+  defp maybe_push(clauses, params, clause, value),
+    do: {[clause | clauses], [value | params]}
 
-      query =
-        to_query(filter,
-          limit: @search_fetch_limit,
-          offset: 0
-        )
-
-      case Ash.read(query, domain: LoggerDashboard.Logs) do
-        {:ok, rows} ->
-          rows
-          |> apply_message_filter(search)
-          |> Enum.drop(fetch_offset)
-          |> Enum.take(fetch_limit)
-          |> then(&{:ok, &1})
-
-        {:error, error} ->
-          {:error, error}
-      end
-    end
-  end
-
-  def search_fetch_limit, do: @search_fetch_limit
+  @doc "The page size applied when the URL carries no `limit`."
+  @spec default_limit() :: pos_integer()
   def default_limit, do: @default_limit
-  def max_limit, do: @max_limit
-  def levels, do: @levels
 
-  defp parse_node(params) do
-    node = get(params, "node", "") |> to_string() |> String.trim()
-    scope = get(params, "scope", get(params, "node_scope", "all"))
+  @doc """
+  The page sizes the viewer's per-page control offers, as strings.
 
-    cond do
-      node != "" -> {:ok, node}
-      scope in ["node", "one"] -> {:ok, ""}
-      true -> {:ok, nil}
-    end
+  Owned here so the offered values have one source: the template renders this
+  list rather than restating it, and the values cannot drift from the ones this
+  module documents. A parsed `limit` that is not in this list is still honoured
+  by `parse/1`; a caller rendering a control needs `limit_options/1` to show it.
+  """
+  @spec page_sizes() :: [String.t()]
+  def page_sizes, do: @page_sizes
+
+  @doc """
+  `page_sizes/0` with the active `limit` appended when it is not already offered.
+
+  An existing link can carry a page size the control no longer lists, and a
+  select whose options exclude the active value renders with nothing selected —
+  which reads as "no page size chosen" rather than "this page is showing N
+  rows". Appending the active value represents it, and appending nothing when it
+  is already offered keeps the control at exactly the offered set.
+  """
+  @spec limit_options(pos_integer()) :: [String.t()]
+  def limit_options(limit) when is_integer(limit) do
+    active = Integer.to_string(limit)
+
+    if active in @page_sizes, do: @page_sizes, else: @page_sizes ++ [active]
   end
 
   defp parse_search(params) do
@@ -187,7 +353,27 @@ defmodule LoggerDashboard.Logs.Filter do
     end
   end
 
-  defp parse_range(params) do
+  defp parse_preset(params) do
+    case get(params, "preset", nil) |> to_string() |> String.trim() do
+      "" -> {:ok, nil}
+      trimmed -> {:ok, trimmed}
+    end
+  end
+
+  # A present `preset` determines both bounds and any explicit `from`/`to` in
+  # the same request is ignored. Selecting a shortcut is the more recent and
+  # more explicit action, and resolving a window over a half-typed bound would
+  # be surprising. The corollary lives in the web layer: a manual edit submits
+  # the form without `preset`, so a typed bound always replaces a shortcut.
+  defp parse_range(params, preset) do
+    if preset do
+      resolve_preset(preset, DateTime.utc_now())
+    else
+      parse_explicit_range(params)
+    end
+  end
+
+  defp parse_explicit_range(params) do
     with {:ok, from} <- parse_dt(get(params, "from", "")),
          {:ok, to} <- parse_dt(get(params, "to", "")) do
       cond do
@@ -241,39 +427,4 @@ defmodule LoggerDashboard.Logs.Filter do
   rescue
     _ -> Map.get(params, key, default)
   end
-
-  defp maybe_filter_node(query, nil), do: query
-
-  defp maybe_filter_node(query, ""), do: query
-
-  defp maybe_filter_node(query, node) do
-    require Ash.Query
-    Ash.Query.filter(query, node: node)
-  end
-
-  defp maybe_filter_level(query, "all"), do: query
-  defp maybe_filter_level(query, nil), do: query
-
-  defp maybe_filter_level(query, level) do
-    require Ash.Query
-    Ash.Query.filter(query, level: String.to_existing_atom(level))
-  rescue
-    ArgumentError ->
-      require Ash.Query
-      Ash.Query.filter(query, level: String.to_atom(level))
-  end
-
-  defp maybe_filter_range(query, nil, nil), do: query
-
-  defp maybe_filter_range(query, from, to) do
-    require Ash.Query
-
-    query
-    |> then(fn q -> if from, do: Ash.Query.filter(q, timestamp >= ^from), else: q end)
-    |> then(fn q -> if to, do: Ash.Query.filter(q, timestamp <= ^to), else: q end)
-  end
-
-  defp message_of(%{message: m}) when is_binary(m), do: m
-  defp message_of(%{"message" => m}) when is_binary(m), do: m
-  defp message_of(row) when is_map(row), do: to_string(Map.get(row, :message, ""))
 end

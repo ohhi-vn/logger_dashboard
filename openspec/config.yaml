@@ -3,11 +3,45 @@ schema: spec-driven
 # Project context (optional)
 # This is shown to AI when creating artifacts.
 # Add your tech stack, conventions, style guides, domain knowledge, etc.
-# Example:
-#   context: |
-#     Tech stack: TypeScript, React, Node.js
-#     We use conventional commits
-#     Domain: e-commerce platform
+context: |
+  Phoenix 1.8 + LiveView 1.2 dashboard over the `logs` table owned by the
+  `clickhouse_ex_logger` dependency. Ash 3.33.11 + AshClickhouse 0.7.3 +
+  AshDyan 0.6 read through `ClickhouseExLogger.Repo`. DDL stays upstream
+  (`mix clickhouse_ex_logger.migrate`); the dashboard never migrates.
+
+  ## Text predicates cannot be pushed down through Ash
+
+  `Ash.Query.Operator` in Ash 3.33 exposes only eq, greater_than,
+  greater_than_or_equal, has, in, is_nil, less_than, less_than_or_equal,
+  not_eq, and overlap. There is no `:like`, `:contains`, or `:starts_with`,
+  so `Ash.Query.filter(like(message, ^pattern))` fails with
+  `Ash.Error.Query.NoSuchFunction` before the data layer is consulted — even
+  though AshClickhouse's `query_builder.ex` implements `build_comparison(:like, ...)`
+  and would emit `message LIKE ?` correctly. Those clauses are unreachable
+  with this Ash version.
+
+  Consequence: any text search must use raw SQL. Do not retry Ash filter
+  expressions for `message`, and do not treat the AshClickhouse `:like`
+  clause as evidence that pushdown works.
+
+  Raw SQL through `ClickhouseExLogger.Repo.query/3` is the sanctioned escape
+  hatch, already established by `LoggerDashboard.Logs.Prune`. Two constraints
+  to respect when writing it:
+
+  - Rows arrive as positional lists and `result.columns` is `nil`, so the
+    caller must know its own projection order. Derive it from the resource
+    (`Ash.Resource.Info.attributes/1`) rather than hand-writing it.
+  - The driver ships no `JSONEachRow` decoder. An unsupported `default_format`
+    returns `%ClickHouse.Result{rows: nil}` **without raising**, so treat a
+    `nil` rows field as an error, never as an empty result set.
+
+  Always bind every value as a parameter. No user input reaches a SQL string.
+
+  ## Testing
+
+  Tests tagged `:clickhouse` need a running ClickHouse and are not excluded
+  automatically, so `mix precommit` fails outright without one. ClickHouse
+  DDL is upstream; bring one up before running the full suite.
 
 # Per-artifact rules (optional)
 # Add custom rules for specific artifacts.

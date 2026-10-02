@@ -2,32 +2,108 @@
 
 ## Purpose
 
-Lets operators browse logs shipped by `clickhouse_ex_logger` from a single place, scoped to one node or all nodes with fast time-pruned filtering.
+Lets operators browse logs shipped by `clickhouse_ex_logger` from a single place, scoped to one or more nodes or all nodes with fast time-pruned filtering.
 
 ## Requirements
 
 ### Requirement: Node-scoped log listing
 
-The system SHALL list log rows from the shared `logs` table scoped to a selected node or to all nodes, defaulting to newest-first by `timestamp`.
+The system SHALL list log rows from the shared `logs` table scoped to zero, one, or more selected nodes, defaulting to newest-first by `timestamp`. A scope with no selected node SHALL include every node, including rows where `node` is NULL. A scope with one or more selected nodes SHALL match rows whose `node` equals any selected value.
+
+Each row SHALL be rendered as a single line rather than as a stacked card, carrying the UTC `timestamp`, `level`, `node`, `message`, and the available source location on that one line. The row SHALL carry a visual accent keyed to its level so that `error` and `warning` rows are distinguishable while scanning. Level SHALL remain readable as text and SHALL NOT be conveyed by color alone.
+
+A row SHALL NOT exceed a single line's height. A `message` too long to fit within the available width SHALL be shortened with a trailing ellipsis on the row, and the untruncated message SHALL remain reachable: it is exposed on hover and shown in full when that row is expanded. Nothing in the shortening SHALL be discarded from the system, and the export of that page SHALL carry the untruncated message. Expanding a row SHALL reveal the full `message` and, when the row carries them, its `metadata`; it SHALL NOT change the page's filters, its page position, or the rows on the page.
+
+Spacing between and within rows SHALL be tight enough that the rows in a page are legible as a continuous list rather than as separated cards.
 
 #### Scenario: View logs for a node
 
 - **WHEN** user selects node `my_app@10.0.0.5`
-- **THEN** system shows only rows where `node` equals that value ordered by `timestamp` descending
+- **THEN** system shows only rows where `node` equals that value ordered by
+  `timestamp` descending
+
+#### Scenario: View logs for multiple nodes
+
+- **WHEN** user selects nodes `my_app@10.0.0.5` and `my_app@10.0.0.6`
+- **THEN** system shows rows where `node` equals either selected value, ordered
+  by `timestamp` descending
 
 #### Scenario: View logs for whole system
 
-- **WHEN** user selects "All nodes" scope
-- **THEN** system shows rows from all nodes including rows where `node` is NULL, ordered by `timestamp` descending
+- **WHEN** user selects no node
+- **THEN** system shows rows from all nodes including rows where `node` is
+  NULL, ordered by `timestamp` descending
+
+#### Scenario: Node values are bound, not interpolated
+
+- **WHEN** user supplies one or more node values
+- **THEN** system matches them with bound parameters and no node text reaches
+  the SQL string
 
 #### Scenario: Log row contents
 
 - **WHEN** a log row is rendered
-- **THEN** system shows `timestamp` (UTC), `level`, `node`, `message`, and available `module`/`function`/`file`/`line`/`metadata`
+- **THEN** system shows `timestamp` (UTC), `level`, `node`, `message`, and
+  available `module`/`function`/`file`/`line`/`metadata`
+
+#### Scenario: A row occupies a single line
+
+- **WHEN** a log row is rendered
+- **THEN** its `timestamp`, `level`, `node`, `message`, and available source
+  location all appear on one line, and the row is no taller than one line
+
+#### Scenario: An over-long message is shortened on the row
+
+- **WHEN** a row's `message` is longer than the available width
+- **THEN** the row shows the message shortened with a trailing ellipsis, does
+  not grow taller than one line, and does not wrap
+
+#### Scenario: The full message is available on hover
+
+- **WHEN** a row's message has been shortened
+- **THEN** the untruncated message is exposed for that row on hover
+
+#### Scenario: Expanding a row shows the full message
+
+- **WHEN** user expands a row
+- **THEN** the full untruncated `message` is shown for that row
+
+#### Scenario: Expanding a row shows its metadata
+
+- **WHEN** user expands a row that carries a non-empty `metadata` map
+- **THEN** system shows that metadata alongside the full message
+
+#### Scenario: Expanding a row leaves the page otherwise unchanged
+
+- **WHEN** user expands a row
+- **THEN** the page's filters, its page position, and the rows shown are
+  unchanged
+
+#### Scenario: A row with no metadata expands to its message alone
+
+- **WHEN** user expands a row whose `metadata` is empty
+- **THEN** the full message is shown and no empty metadata section is offered
+
+#### Scenario: Non-empty metadata is shown
+
+- **WHEN** a log row carries a non-empty `metadata` map
+- **THEN** system shows that metadata with the row once the row is expanded
+
+#### Scenario: Level is distinguishable by accent and readable as text
+
+- **WHEN** rows of differing levels are shown together
+- **THEN** each row's accent corresponds to its level and the level remains
+  present as text
+
+#### Scenario: Rows read as a continuous list
+
+- **WHEN** a page shows several rows
+- **THEN** the spacing within and between the rows is tight enough that the
+  page reads as a continuous list of log lines rather than as separated cards
 
 ### Requirement: Wildcard text search
 
-The system SHALL support wildcard text search over `message` (e.g. `*timeout*`, `db_*`) translated to a ClickHouse `LIKE`/`match` predicate.
+The system SHALL support wildcard text search over `message` (e.g. `*timeout*`, `db_*`) translated to a ClickHouse `LIKE`/`match` predicate. The predicate SHALL be evaluated by the database against every row in the active scope, not applied in application memory to a bounded subset.
 
 #### Scenario: Wildcard search filters rows
 
@@ -38,6 +114,16 @@ The system SHALL support wildcard text search over `message` (e.g. `*timeout*`, 
 
 - **WHEN** search text is empty
 - **THEN** system applies no message predicate
+
+#### Scenario: Search matches beyond the most recent rows
+
+- **WHEN** matching rows exist that are not among the most recent rows in the active scope
+- **THEN** system still returns those matches, and returns them in the same pagination sequence as unsearched rows
+
+#### Scenario: Search combines with other active filters
+
+- **WHEN** user enters a search pattern together with a node scope, datetime range, and level
+- **THEN** system applies the message pattern only to rows already matching that scope, range, and level
 
 ### Requirement: Datetime-range filter
 
@@ -66,17 +152,169 @@ The system SHALL filter by log level for `error`, `warning`, `info`, `debug`, pl
 
 - **WHEN** user selects `all`
 - **THEN** system applies no level predicate
-
 ### Requirement: Paginated newest-first browsing
 
-The system SHALL paginate log results with limit/offset and preserve active filters across pages.
+The system SHALL paginate log results with limit/offset and preserve active filters across pages. Pages SHALL be drawn from the complete set of rows matching the active filters.
+
+The per-page row count SHALL be selectable from 100, 500, and 3000, and 100 SHALL be used when no page size is specified. A page SHALL hold at most 3000 rows.
+
+A page size carried in the URL that reads as a positive whole number SHALL be honoured, so a page size that is no longer offered but still reachable by an existing link keeps working. A page size above 3000 SHALL be capped at 3000. A page size that does not read as a positive whole number SHALL fall back to 100 rather than being rejected.
 
 #### Scenario: Paginate filtered logs
 
 - **WHEN** user advances to the next page with filters active
-- **THEN** system keeps node, search, datetime-range, and level filters and shows the next slice in `timestamp` descending order
+- **THEN** system keeps node, search, datetime-range, and level filters and shows
+  the next slice in `timestamp` descending order
 
 #### Scenario: Empty result
 
 - **WHEN** no rows match the active filters
 - **THEN** system shows an empty state naming the active scope/filters
+
+#### Scenario: Last page signals end of results
+
+- **WHEN** a page returns fewer rows than the per-page limit
+- **THEN** system indicates that no further pages exist and offers no way to
+  advance past the last page
+
+#### Scenario: Page size and scope are preserved when advancing
+
+- **WHEN** user advances from a page and the active filters are unchanged
+- **THEN** system keeps the per-page size and the active scope in the resulting
+  page
+
+#### Scenario: The offered page sizes are 100, 500, and 3000
+
+- **WHEN** user views the per-page row count control
+- **THEN** it offers exactly the choices 100, 500, and 3000
+
+#### Scenario: The default page size is 100
+
+- **WHEN** user opens the viewer with no page size specified
+- **THEN** the page shows at most 100 rows and the control shows 100 as the
+  active page size
+
+#### Scenario: Selecting a page size shows that many rows
+
+- **WHEN** user selects 500 as the per-page row count
+- **THEN** the page shows at most 500 rows, and the same size stays in effect
+  while advancing to the next page
+
+#### Scenario: A page size outside the offered set is still honoured
+
+- **WHEN** a URL carries a per-page row count that reads as a positive whole
+  number but is not one of 100, 500, or 3000
+- **THEN** system uses that page size rather than rejecting the request
+
+#### Scenario: A page size above the maximum is capped
+
+- **WHEN** a URL carries a per-page row count greater than 3000
+- **THEN** the page holds at most 3000 rows
+
+#### Scenario: An unreadable page size falls back to the default
+
+- **WHEN** a URL carries a per-page row count that is not a positive whole
+  number
+- **THEN** system uses 100 and reports no error
+
+### Requirement: Multi-value node input
+
+The system SHALL accept a node filter containing one or more node names separated by commas. It SHALL trim surrounding whitespace from each entry, ignore blank entries, and treat an input that reduces to no entries as "all nodes". It SHALL display the active node scope on the page and provide a single action that clears the node filter back to all nodes.
+
+#### Scenario: Comma-separated nodes parse to a set
+
+- **WHEN** user enters `my_app@10.0.0.5, my_app@10.0.0.6`
+- **THEN** system filters by both nodes
+
+#### Scenario: Whitespace and blank entries ignored
+
+- **WHEN** user enters `my_app@10.0.0.5, , my_app@10.0.0.6,`
+- **THEN** system filters by the two non-blank nodes
+
+#### Scenario: Blank input means all nodes
+
+- **WHEN** user submits a node filter that is empty or only commas/whitespace
+- **THEN** system applies no node predicate
+
+#### Scenario: Active node scope is visible and clearable
+
+- **WHEN** a node filter is active
+- **THEN** system shows the selected nodes on the page and offers a clear action that returns to all nodes
+
+### Requirement: Export the current page as raw text
+
+The system SHALL offer an export of the rows currently shown on the viewer, as a plain-text file the browser downloads. The export SHALL cover exactly the rows on the current page, under the node, search, datetime-range, level, and page-size filters and the current page position in effect when the export is taken. It SHALL NOT include rows from other pages and SHALL NOT widen the scope to the whole filtered result set.
+
+Each exported line SHALL carry the UTC `timestamp`, the `level`, the `node`, the untruncated `message`, and the source location when the row has one, so that a line can be matched back to the row it came from. A row with no node SHALL be exported as an explicit placeholder rather than as an empty field. Lines SHALL be ordered newest-first by `timestamp`, matching the order on the page.
+
+The exported message SHALL be the message as stored, not the shortened text shown on the row. A message containing newlines SHALL be rendered in a way that keeps one exported record's fields together rather than interleaving them with the next record's fields.
+
+The file SHALL be served as plain text with a name that identifies it as a log export, and the download SHALL NOT change the page's filters, its page position, or the rows shown.
+
+#### Scenario: Exporting downloads a plain-text file
+
+- **WHEN** user triggers the export
+- **THEN** the browser downloads a plain-text file of the current page's rows
+
+#### Scenario: The export covers the current page only
+
+- **WHEN** user exports from a page that is not the first page
+- **THEN** the file contains exactly the rows shown on that page and no rows from
+  any other page
+
+#### Scenario: The export honours the active filters
+
+- **WHEN** user exports while a node scope, search, datetime range, and level are
+  active
+- **THEN** the file contains only rows matching those filters
+
+#### Scenario: The export honours the active page position
+
+- **WHEN** user exports after advancing to a later page
+- **THEN** the file contains the rows of that page rather than restarting from
+  the first page
+
+#### Scenario: Each line carries timestamp, level, node, and message
+
+- **WHEN** user exports a page
+- **THEN** each line carries the row's UTC `timestamp`, its `level`, its
+  `node`, and its `message`
+
+#### Scenario: A line carries the source location when the row has one
+
+- **WHEN** an exported row carries `module`/`function`/`file`/`line`
+- **THEN** that line carries the source location
+
+#### Scenario: A row with no node exports a placeholder
+
+- **WHEN** an exported row has no `node`
+- **THEN** that line shows an explicit placeholder rather than an empty field
+
+#### Scenario: The exported message is not the shortened text
+
+- **WHEN** user exports a page containing a row whose message is too long to
+  show on one line
+- **THEN** that line carries the full untruncated message
+
+#### Scenario: A multi-line message does not interleave with the next record
+
+- **WHEN** an exported row's message contains newlines
+- **THEN** the fields of the following record are not interleaved into that
+  message, and each record's fields stay together
+
+#### Scenario: Exporting preserves newest-first order
+
+- **WHEN** user exports a page
+- **THEN** the lines appear in the same newest-first order as the rows on the
+  page
+
+#### Scenario: Exporting does not disturb the page
+
+- **WHEN** user triggers the export
+- **THEN** the page's filters, its page position, and the rows shown are
+  unchanged
+
+#### Scenario: Exporting an empty page yields an empty file
+
+- **WHEN** user exports a page showing no rows
+- **THEN** the download succeeds and the file contains no rows

@@ -12,17 +12,31 @@ defmodule LoggerDashboard.Logs.Prune do
   alias LoggerDashboard.Logs.Filter
 
   @doc "Parse prune params; requires explicit scope (`node` + value or `all`)."
+  @unbounded_error "This prune has no datetime range. Supply a `from` or `to` to bound it."
+  @multi_node_error "Pruning targets exactly one node. Supply a single node, or choose whole-system scope."
+
   @spec parse(map()) :: {:ok, Filter.t(), :node | :all} | {:error, String.t()}
   def parse(params) when is_map(params) do
-    scope = params |> Map.get("scope", Map.get(params, :scope, "all")) |> to_string()
+    scope = params |> Map.get("scope", Map.get(params, :scope)) |> to_string() |> String.trim()
     node = params |> Map.get("node", Map.get(params, :node, "")) |> to_string() |> String.trim()
 
     cond do
+      # An absent scope is not whole-system. Defaulting here would compile to
+      # `DELETE WHERE 1 = 1` whenever a request arrived without the parameter.
+      scope == "" ->
+        {:error, "Select a scope: single node or whole system."}
+
+      scope not in ["node", "all", "all-nodes"] ->
+        {:error, "Invalid prune scope."}
+
       scope == "node" and node == "" ->
         {:error, "Select a node to prune, or choose whole-system scope."}
 
-      scope not in ["node", "all", "all-nodes", ""] ->
-        {:error, "Invalid prune scope."}
+      scope == "node" and length(Filter.parse_nodes(%{"node" => node})) > 1 ->
+        # A prune deletes rows and the confirmation states one node. Accepting a
+        # comma-separated value here would let the confirmation understate the
+        # blast radius, so a multi-node value is rejected rather than narrowed.
+        {:error, @multi_node_error}
 
       true ->
         normalized =
@@ -31,23 +45,26 @@ defmodule LoggerDashboard.Logs.Prune do
           |> Map.delete("search")
           |> Map.delete(:search)
 
-        case Filter.parse(normalized) do
-          {:ok, filter} ->
-            scope_atom = if scope == "node", do: :node, else: :all
-            {:ok, %{filter | search: ""}, scope_atom}
-
-          error ->
-            error
+        with {:ok, filter} <- Filter.parse(normalized),
+             :ok <- require_bounds(filter) do
+          scope_atom = if scope == "node", do: :node, else: :all
+          {:ok, %{filter | search: ""}, scope_atom}
         end
     end
   end
+
+  # A prune bounded by neither end would delete every row in scope. There is
+  # deliberately no override: an operator who wants that can pass an
+  # arbitrarily wide range, but omitting the bound is never the way to get it.
+  defp require_bounds(%Filter{from: nil, to: nil}), do: {:error, @unbounded_error}
+  defp require_bounds(%Filter{}), do: :ok
 
   @doc "Describe the resolved predicate for confirmation."
   @spec describe(Filter.t(), :node | :all) :: String.t()
   def describe(%Filter{} = filter, scope) do
     scope_text =
       case scope do
-        :node -> "node #{filter.node}"
+        :node -> "node #{Enum.join(filter.nodes, ", ")}"
         :all -> "all nodes"
       end
 
@@ -66,7 +83,7 @@ defmodule LoggerDashboard.Logs.Prune do
   """
   @spec run(Filter.t(), :node | :all) :: {:ok, String.t()} | {:error, String.t()}
   def run(%Filter{} = filter, scope) when scope in [:node, :all] do
-    if scope == :node and filter.node in [nil, ""] do
+    if scope == :node and filter.nodes == [] do
       {:error, "Select a node to prune, or choose whole-system scope."}
     else
       {where_sql, params} = where_clause(filter, scope)
@@ -89,44 +106,13 @@ defmodule LoggerDashboard.Logs.Prune do
   @doc false
   @spec where_clause(Filter.t(), :node | :all) :: {String.t(), list()}
   def where_clause(%Filter{} = filter, scope) do
-    {clauses, params} = {[], []}
-
-    {clauses, params} =
-      if scope == :node do
-        {["node = ?" | clauses], [filter.node | params]}
-      else
-        {clauses, params}
-      end
-
-    {clauses, params} =
-      if filter.level not in [nil, "all", ""] do
-        {["level = ?" | clauses], [filter.level | params]}
-      else
-        {clauses, params}
-      end
-
-    {clauses, params} =
-      if filter.from do
-        {["timestamp >= ?" | clauses], [format_ts(filter.from) | params]}
-      else
-        {clauses, params}
-      end
-
-    {clauses, params} =
-      if filter.to do
-        {["timestamp <= ?" | clauses], [format_ts(filter.to) | params]}
-      else
-        {clauses, params}
-      end
-
-    clauses = Enum.reverse(clauses)
-    params = Enum.reverse(params)
-
-    if clauses == [] do
-      {"1 = 1", []}
-    else
-      {Enum.join(clauses, " AND "), params}
-    end
+    # `parse/1` already folds scope into the filter: a node scope carries the
+    # node value, a whole-system scope carries `""`. `Filter.predicates/1` then
+    # emits `node = ?` only when that value is present, so the scope argument
+    # needs no separate handling. Message is excluded because `parse/1` forces
+    # `search: ""`, which yields no `message LIKE ?` clause.
+    _ = scope
+    Filter.predicates(filter)
   end
 
   defp qualified_table do
@@ -139,8 +125,6 @@ defmodule LoggerDashboard.Logs.Prune do
 
     if database, do: "#{database}.logs", else: "logs"
   end
-
-  defp format_ts(%DateTime{} = dt), do: dt
 
   defp truncate(message, max) when byte_size(message) > max,
     do: String.slice(message, 0, max) <> "…"

@@ -20,55 +20,78 @@ defmodule LoggerDashboardWeb.Layouts do
 
   ## Examples
 
-      <Layouts.app flash={@flash}>
+      <Layouts.app flash={@flash} active={:logs}>
         <h1>Content</h1>
       </Layouts.app>
 
   """
   attr :flash, :map, required: true, doc: "the map of flash messages"
 
-  attr :current_scope, :map,
-    default: nil,
-    doc: "the current [scope](https://phoenix.hexdocs.pm/scopes.html)"
+  attr :active, :atom,
+    values: [:home, :logs, :analysis, :prune],
+    doc: "the current dashboard page, marked in the navigation"
 
   slot :inner_block, required: true
 
+  @nav_items [
+    {:home, "Home", "/"},
+    {:logs, "Logs", "/logs"},
+    {:analysis, "Analysis", "/analysis"},
+    {:prune, "Prune", "/prune"}
+  ]
+
   def app(assigns) do
+    assigns =
+      assigns
+      |> assign_new(:active, fn -> nil end)
+      |> assign(:nav_items, @nav_items)
+
     ~H"""
-    <header class="navbar px-4 sm:px-6 lg:px-8">
-      <div class="flex-1">
-        <a href="/" class="flex-1 flex w-fit items-center gap-2">
-          <img src={~p"/images/logo.svg"} width="36" />
-          <span class="text-sm font-semibold">v{Application.spec(:phoenix, :vsn)}</span>
-        </a>
-      </div>
-      <div class="flex-none">
-        <ul class="flex flex-column px-1 space-x-4 items-center">
-          <li>
-            <a href="https://phoenixframework.org/" class="btn btn-ghost">Website</a>
-          </li>
-          <li>
-            <a href="https://github.com/phoenixframework/phoenix" class="btn btn-ghost">GitHub</a>
-          </li>
-          <li>
-            <.theme_toggle />
-          </li>
-          <li>
-            <a href="https://phoenix.hexdocs.pm/overview.html" class="btn btn-primary">
-              Get Started <span aria-hidden="true">&rarr;</span>
-            </a>
-          </li>
-        </ul>
-      </div>
-    </header>
+    <div class="min-h-screen bg-base-200">
+      <header
+        id="dashboard-header"
+        class="sticky top-0 z-20 border-b border-base-300 bg-base-100/80 backdrop-blur"
+      >
+        <div class="flex flex-wrap items-center gap-x-4 gap-y-3 px-4 py-3 sm:px-6 lg:px-8">
+          <.link
+            navigate={~p"/"}
+            class="flex items-center gap-2 text-sm font-semibold tracking-tight"
+            aria-label="Log dashboard home"
+          >
+            <.icon name="hero-command-line" class="size-5 text-primary" />
+            <span>Log Dashboard</span>
+          </.link>
 
-    <main class="px-4 py-20 sm:px-6 lg:px-8">
-      <div class="mx-auto max-w-2xl space-y-4">
-        {render_slot(@inner_block)}
-      </div>
-    </main>
+          <nav id="dashboard-nav" aria-label="Dashboard sections" class="flex-1">
+            <ul class="flex flex-wrap items-center gap-1 text-sm">
+              <li :for={{key, label, path} <- @nav_items} id={"nav-#{key}"}>
+                <.link
+                  navigate={path}
+                  aria-current={@active == key && "page"}
+                  class={[
+                    "rounded-lg px-3 py-1.5 font-medium transition-colors",
+                    @active == key && "bg-primary text-primary-content",
+                    @active != key && "text-base-content/70 hover:bg-base-300 hover:text-base-content"
+                  ]}
+                >
+                  {label}
+                </.link>
+              </li>
+            </ul>
+          </nav>
 
-    <.flash_group flash={@flash} />
+          <.theme_toggle />
+        </div>
+      </header>
+
+      <main id="dashboard-main" class="px-4 py-8 sm:px-6 lg:px-8">
+        <div class="space-y-6">
+          {render_slot(@inner_block)}
+        </div>
+      </main>
+
+      <.flash_group flash={@flash} />
+    </div>
     """
   end
 

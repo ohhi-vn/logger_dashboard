@@ -92,9 +92,21 @@ defmodule LoggerDashboard.MixProject do
       "ecto.setup": ["ecto.create", "ecto.migrate", "run priv/repo/seeds.exs"],
       "ecto.reset": ["ecto.drop", "ecto.setup"],
       test: ["ecto.create --quiet", "ecto.migrate --quiet", "test"],
-      "assets.setup": ["tailwind.install --if-missing", "esbuild.install --if-missing"],
-      "assets.build": ["compile", "tailwind logger_dashboard", "esbuild logger_dashboard"],
+      "assets.setup": [
+        "tailwind.install --if-missing",
+        "logger_dashboard.sign_tailwind",
+        "esbuild.install --if-missing"
+      ],
+      "assets.build": [
+        "compile",
+        "tailwind.install --if-missing",
+        "logger_dashboard.sign_tailwind",
+        "tailwind logger_dashboard",
+        "esbuild logger_dashboard"
+      ],
       "assets.deploy": [
+        "tailwind.install --if-missing",
+        "logger_dashboard.sign_tailwind",
         "tailwind logger_dashboard --minify",
         "esbuild logger_dashboard --minify",
         "phx.digest"
