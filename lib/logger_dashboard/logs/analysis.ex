@@ -5,6 +5,13 @@ defmodule LoggerDashboard.Logs.Analysis do
   Reuses viewer scope semantics for node/level/timestamp. Message text search
   is intentionally excluded: `ash_clickhouse 0.7.3` cannot translate text
   predicates, so analysis stays on pushable filters.
+
+  ## Result ordering
+
+  A `:frequency` breakdown comes back largest-first, so the node with the most
+  rows and the dominant level are the first ones read. A `:time_bucket` result
+  keeps its labels chronological instead — `AshDyan` rejects a value ordering
+  there for exactly that reason.
   """
 
   alias LoggerDashboard.Logs
@@ -39,7 +46,8 @@ defmodule LoggerDashboard.Logs.Analysis do
         column: :level,
         filters: dyan_filters(filter),
         limit: limit
-      },
+      }
+      |> order_by_count(),
       timeout_opts(opts)
     )
   end
@@ -80,7 +88,8 @@ defmodule LoggerDashboard.Logs.Analysis do
              column: :node,
              filters: dyan_filters(filter),
              limit: limit
-           },
+           }
+           |> order_by_count(),
            timeout_opts(opts)
          ) do
       {:ok, %AshDyan.Result{} = result} -> {:ok, normalize_unknown(result)}
@@ -107,16 +116,46 @@ defmodule LoggerDashboard.Logs.Analysis do
     end
   end
 
-  defp normalize_bucket(bucket) when bucket in @buckets, do: bucket
+  # A `:frequency` breakdown is ordered by count, largest first.
+  #
+  # `Formatter.frequency/2` sorts labels alphabetically unless the request asks
+  # otherwise, which would list nodes and levels by name rather than by volume —
+  # the opposite of what makes a hot node or a dominant level visible.
+  # `AshDyan`'s `sort_order` already defaults to `:desc`, but it is sent
+  # explicitly so this ordering does not invert if that default ever changes.
+  #
+  # Only for `:frequency`: `AshDyan.Analysis.TimeBucket` rejects `:sort_by`
+  # outright, because bucket labels have to stay chronological.
+  defp order_by_count(request) do
+    request
+    |> Map.put(:sort_by, :value)
+    |> Map.put(:sort_order, :desc)
+  end
 
-  defp normalize_bucket(bucket) when is_binary(bucket) do
+  @doc """
+  Resolve a `bucket` param onto one of `buckets/0`, falling back to `default_bucket/0`.
+
+  An unrecognized bucket — a stale link, a hand-edited URL, an atom that was
+  never a bucket — resolves to the default rather than failing the request, so a
+  page always runs a real analysis. The caller uses the returned bucket for both
+  the query and the control that displays it, which is what keeps the two from
+  disagreeing.
+
+  Idempotent: an already-normalized atom passes through unchanged, so a caller
+  may normalize once and hand the result straight to `volume_over_time/3`, which
+  normalizes again.
+  """
+  @spec normalize_bucket(String.t() | atom() | nil) :: atom()
+  def normalize_bucket(bucket) when bucket in @buckets, do: bucket
+
+  def normalize_bucket(bucket) when is_binary(bucket) do
     atom = String.to_existing_atom(bucket)
     if atom in @buckets, do: atom, else: @default_bucket
   rescue
     _ -> @default_bucket
   end
 
-  defp normalize_bucket(_), do: @default_bucket
+  def normalize_bucket(_), do: @default_bucket
 
   # One selected node still goes through `:in`, so the viewer and the analysis
   # page share one node-scope representation. `Ash.Query.Operator` in Ash 3.33

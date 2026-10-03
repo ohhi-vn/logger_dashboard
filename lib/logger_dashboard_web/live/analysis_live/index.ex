@@ -30,12 +30,20 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
   @impl true
   def handle_params(params, _uri, socket) do
     filter_params = Map.take(params, @filter_keys)
-    bucket = Map.get(params, "bucket", "hour")
+    nodes_selected = selected_nodes(filter_params)
+
+    # Normalized once, up front, so the query and the control that displays the
+    # bucket are derived from the same value. `Filter.to_params/1` has no
+    # `bucket` key — it belongs to this page, not to the shared filter — so it
+    # is merged in here. Without it the select would carry no value at all, and
+    # a select with nothing selected displays its first option, which would show
+    # `hour` over results that were computed by day.
+    bucket = Analysis.normalize_bucket(Map.get(params, "bucket"))
 
     socket =
       socket
       |> assign(:filter_params, filter_params)
-      |> assign(:nodes_selected, selected_nodes(filter_params))
+      |> assign(:nodes_selected, nodes_selected)
 
     socket =
       case Filter.parse(Map.put(filter_params, "limit", "50")) do
@@ -44,12 +52,15 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
           |> assign(:filter_error, nil)
           # Built from the parsed filter so the inputs show the values actually
           # applied, including the instants a `preset` resolved to.
-          |> assign(:form, to_form(Filter.to_params(filter), as: :filters))
+          |> assign(:form, to_form(form_params(filter, bucket), as: :filters))
           |> load_analysis(filter, bucket)
 
         {:error, message} ->
           socket
           |> assign(:form, to_form(filter_params, as: :filters))
+          # Assigned last, so clearing the results cannot take the rejection
+          # with it.
+          |> clear_results()
           |> assign(:filter_error, message)
       end
 
@@ -104,18 +115,49 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
   # the same request failed validation and left the query unparsed.
   defp selected_nodes(filter_params), do: Filter.parse_nodes(filter_params)
 
-  # An AshDyan result for a scope with no matching rows carries an empty series,
-  # so `hd/1` on it would raise while rendering. Pairing labels with data goes
-  # through here so a scope that matches nothing renders an empty table instead
-  # of crashing the page.
-  defp pairs(nil), do: []
-
-  defp pairs(%{labels: labels, series: series}) do
-    case series do
-      [%{data: data} | _] -> Enum.zip(labels, data)
-      _ -> []
-    end
+  # The form is built from the parsed filter so the inputs show what was
+  # applied, with this page's own `bucket` added on top. `Filter.to_params/1`
+  # deliberately knows nothing about buckets — they are a presentation choice
+  # this page owns — so omitting the merge here is what left the select blank.
+  defp form_params(filter, bucket) do
+    Map.put(Filter.to_params(filter), "bucket", Atom.to_string(bucket))
   end
+
+  # An AshDyan result for a scope with no matching rows carries an empty series,
+  # so pairing labels with data through `hd/1` would raise while rendering.
+  # Every table goes through here instead, so a scope that matches nothing
+  # renders an empty table rather than crashing the page — and so no table can
+  # quietly show fewer series than the analysis produced.
+  #
+  # `series` is a list whose length depends on the analysis: a `:frequency`
+  # breakdown yields one entry, while a `:time_bucket` split by level yields one
+  # per level. Taking the head of that list is what made the volume table show a
+  # single level's counts with no column saying which level they were, so every
+  # entry becomes its own column here.
+  #
+  # Returns the series names and one row per label, each row being the label
+  # followed by that label's value from every series.
+  @spec series_grid(AshDyan.Result.t() | nil) :: {[String.t()], [[term()]]}
+  defp series_grid(nil), do: {[], []}
+
+  defp series_grid(%{labels: labels, series: series}) do
+    headers = Enum.map(series, & &1.name)
+
+    rows =
+      labels
+      |> Enum.with_index()
+      |> Enum.map(fn {label, index} ->
+        [label | Enum.map(series, &Enum.at(&1.data, index, 0))]
+      end)
+
+    {headers, rows}
+  end
+
+  defp row_label([label | _values]), do: label
+
+  # `Enum.zip/2` stops at the shorter list, so a row and the series names that
+  # produced it can never render misaligned cells.
+  defp row_values([_label | values], headers), do: Enum.zip(headers, values)
 
   defp load_analysis(socket, filter, bucket) do
     limit = 1_000
@@ -132,17 +174,60 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
         level: AshDyan.Charts.to_chartjs(levels),
         volume: AshDyan.Charts.to_chartjs(volume)
       })
-      |> assign(:applied_limit, limit)
+      |> assign(:applied_limit, Analysis.applied_limit(opts))
       |> assign(:analysis_error, nil)
     else
       {:error, error} ->
         socket
-        |> assign(:levels, nil)
-        |> assign(:volume, nil)
-        |> assign(:nodes, nil)
-        |> assign(:charts, %{})
+        |> clear_results()
         |> assign(:analysis_error, ClickHouseError.friendly(error))
     end
+  end
+
+  # A rejected request computed nothing, so it must leave nothing on screen. The
+  # previous request's numbers are worse than no numbers: they read as this
+  # scope's results while describing a different query.
+  defp clear_results(socket) do
+    socket
+    |> assign(:levels, nil)
+    |> assign(:volume, nil)
+    |> assign(:nodes, nil)
+    |> assign(:charts, %{})
+    |> assign(:analysis_error, nil)
+  end
+
+  # One shape for all three breakdowns, so the tables cannot drift apart in the
+  # way that let the volume table diverge from the chart beside it. `label_header`
+  # names a row's first cell — `Level`, `Bucket`, `Node` — and each remaining
+  # column is named by the series it came from.
+  attr :id, :string, required: true
+  attr :label_header, :string, required: true
+  attr :result, :any, required: true
+
+  defp result_table(assigns) do
+    {headers, rows} = series_grid(assigns.result)
+
+    assigns =
+      assigns
+      |> assign(:headers, headers)
+      |> assign(:rows, rows)
+
+    ~H"""
+    <table class="table table-sm mt-2" id={@id}>
+      <thead>
+        <tr>
+          <th scope="col">{@label_header}</th>
+          <th :for={name <- @headers} scope="col" data-series={name}>{name}</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr :for={row <- @rows}>
+          <th scope="row">{row_label(row)}</th>
+          <td :for={{name, value} <- row_values(row, @headers)} data-series={name}>{value}</td>
+        </tr>
+      </tbody>
+    </table>
+    """
   end
 
   @impl true
@@ -242,15 +327,7 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
             phx-hook=".LogChart"
             phx-update="ignore"
           />
-          <table class="table table-sm mt-2" id="analysis-levels">
-            <tbody>
-              <%= for {label, value} <- pairs(@levels) do %>
-                <tr>
-                  <td>{label}</td><td>{value}</td>
-                </tr>
-              <% end %>
-            </tbody>
-          </table>
+          <.result_table id="analysis-levels" label_header="Level" result={@levels} />
         </div>
 
         <div class="rounded-xl border border-base-300 bg-base-100 p-4">
@@ -261,29 +338,13 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
             phx-hook=".LogChart"
             phx-update="ignore"
           />
-          <table class="table table-sm mt-2" id="analysis-volume">
-            <tbody>
-              <%= for {label, value} <- pairs(@volume) do %>
-                <tr>
-                  <td>{label}</td><td>{value}</td>
-                </tr>
-              <% end %>
-            </tbody>
-          </table>
+          <.result_table id="analysis-volume" label_header="Bucket" result={@volume} />
         </div>
       </div>
 
       <div class="rounded-xl border border-base-300 bg-base-100 p-4">
         <h2 class="font-semibold">By node</h2>
-        <table class="table table-sm mt-2" id="analysis-nodes">
-          <tbody>
-            <%= for {label, value} <- pairs(@nodes) do %>
-              <tr>
-                <td>{label}</td><td>{value}</td>
-              </tr>
-            <% end %>
-          </tbody>
-        </table>
+        <.result_table id="analysis-nodes" label_header="Node" result={@nodes} />
       </div>
 
       <script :type={Phoenix.LiveView.ColocatedHook} name=".LogChart">

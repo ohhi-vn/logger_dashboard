@@ -1,10 +1,10 @@
-# Spec Delta
+# Compose Deployment Specification
 
 ## Purpose
 
-Gives operators a single declarative Podman Compose stack — dashboard plus a single-node ClickHouse — that builds the release image, provisions credentials, applies the ClickHouse schema before serving, and persists logs, so a working deployment needs no hand-assembled container commands.
+Gives operators a single declarative Podman Compose stack — dashboard plus a single-node ClickHouse — that builds the release image, provisions credentials, applies the ClickHouse schema before serving, and persists logs, so a working deployment needs no hand-assembled container commands and no Postgres instance.
 
-## ADDED Requirements
+## Requirements
 
 ### Requirement: Single-command stack startup
 
@@ -19,6 +19,11 @@ The system SHALL provide a compose file at the repository root that brings up th
 
 - **WHEN** an operator inspects the running stack
 - **THEN** the only services are the dashboard and ClickHouse, with no database, cache, or proxy that the operator must supply separately
+
+#### Scenario: No Postgres service or dependency
+
+- **WHEN** an operator inspects the compose file and the environment file it reads
+- **THEN** neither names a Postgres service, `DATABASE_URL`, `POOL_SIZE`, or any Postgres credential, and the stack starts without a Postgres instance reachable
 
 #### Scenario: Docker compatibility
 
@@ -71,6 +76,16 @@ The system SHALL read all secrets from a gitignored environment file, ship a com
 
 - **WHEN** an operator reads the example environment file
 - **THEN** it lists every variable the stack reads, marks the required ones, and gives the command that generates each generated value
+
+#### Scenario: The dashboard authenticates to the password-protected ClickHouse
+
+- **WHEN** an operator brings the stack up with a non-empty `CLICKHOUSE_PASSWORD`
+- **THEN** the dashboard's ClickHouse URL carries those credentials so the server accepts its queries, and the deployment does not depend on a `CLICKHOUSE_USER`/`CLICKHOUSE_PASSWORD` pair that the client never sends
+
+#### Scenario: Log rows are readable from the protected store
+
+- **WHEN** an operator authenticates to `/logs` on a stack whose ClickHouse requires the password
+- **THEN** log rows are returned from the store rather than an authentication or missing-table error
 
 ### Requirement: ClickHouse schema is applied before the dashboard serves
 

@@ -52,12 +52,85 @@ defmodule LoggerDashboard.Logs.AnalysisTest do
     assert joined["info"] == 1
   end
 
+  test "level_frequency lists the dominant level first", %{node: node} do
+    # The scope holds 2 error rows and 1 info row, so descending-by-count and
+    # alphabetical ("debug" < "error" < "info") cannot both produce this order.
+    assert {:ok, filter} = Filter.parse(%{"node" => node})
+    assert {:ok, result} = Analysis.level_frequency(filter, limit: 100)
+
+    assert result.labels == ["error", "info"]
+    assert hd(result.series).data == [2, 1]
+  end
+
+  test "node_frequency lists the busiest node first", %{node: node} do
+    # The second node is named so it sorts *before* the setup node
+    # alphabetically while holding *fewer* rows, so an alphabetical ordering
+    # fails this assertion rather than accidentally satisfying it.
+    quieter = "aaa-quieter-#{System.unique_integer([:positive])}@host"
+
+    now = DateTime.truncate(DateTime.utc_now(), :microsecond)
+
+    assert {:ok, _} =
+             ClickhouseExLogger.Insert.insert([
+               %{
+                 id: Ash.UUID.generate(),
+                 timestamp: DateTime.add(now, -300, :second),
+                 level: "info",
+                 message: "quieter node row",
+                 module: "Test",
+                 file: nil,
+                 line: nil,
+                 function: nil,
+                 metadata: %{},
+                 node: quieter
+               }
+             ])
+
+    Process.sleep(2_000)
+
+    on_exit(fn -> ClickhouseExLogger.Repo.query("DELETE FROM logs WHERE node = ?", [quieter]) end)
+
+    assert {:ok, filter} = Filter.parse(%{"node" => "#{node},#{quieter}"})
+    assert {:ok, result} = Analysis.node_frequency(filter, limit: 1_000)
+
+    assert result.labels == [node, quieter]
+    assert hd(result.series).data == [3, 1]
+  end
+
   test "volume_over_time buckets counts", %{node: node} do
     assert {:ok, filter} = Filter.parse(%{"node" => node})
     assert {:ok, result} = Analysis.volume_over_time(filter, :hour, limit: 100)
 
     assert result.type == :time_bucket
     assert Enum.sum(hd(result.series).data) == 3
+  end
+
+  test "volume_over_time keeps bucket labels chronological", %{node: node} do
+    # The scope spans 70 and 20 minutes ago, which is always two calendar hours,
+    # and a value ordering is not available on `:time_bucket`. So the labels
+    # must arrive in time order.
+    assert {:ok, filter} = Filter.parse(%{"node" => node})
+    assert {:ok, result} = Analysis.volume_over_time(filter, :hour, limit: 100)
+
+    assert length(result.labels) == 2
+    assert result.labels == Enum.sort(result.labels)
+    assert Enum.sort(hd(result.series).data) == [1, 2]
+  end
+
+  test "normalize_bucket resolves an unsupported bucket onto the default" do
+    assert Analysis.normalize_bucket("nope") == Analysis.default_bucket()
+    assert Analysis.normalize_bucket(nil) == Analysis.default_bucket()
+    assert Analysis.normalize_bucket(123) == Analysis.default_bucket()
+
+    assert Analysis.normalize_bucket("day") == :day
+    assert Analysis.normalize_bucket(:day) == :day
+  end
+
+  test "normalize_bucket is idempotent over every offered bucket" do
+    for bucket <- Analysis.buckets() do
+      assert Analysis.normalize_bucket(Atom.to_string(bucket)) == bucket
+      assert Analysis.normalize_bucket(bucket) == bucket
+    end
   end
 
   test "node_frequency rolls NULL into unknown", %{node: _node} do
