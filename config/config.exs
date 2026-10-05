@@ -67,6 +67,13 @@ config :phoenix, :json_library, Jason
 config :clickhouse_ex_logger,
   ash_domains: [ClickhouseExLogger.Domain]
 
+# The dashboard supervises `ClickhouseExLogger.Repo` itself (see
+# `LoggerDashboard.Application`), so the dependency must not start it too:
+# a second connection under the same name crashes with
+# `ArgumentError: table name already exists` (globally named ETS table).
+# Inert on versions without `ClickhouseExLogger.Application`.
+config :clickhouse_ex_logger, auto_start: false
+
 config :clickhouse_ex_logger, ClickhouseExLogger.Repo,
   url: "http://localhost:8123",
   username: "default",

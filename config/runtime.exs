@@ -27,7 +27,7 @@ config :clickhouse_ex_logger, ClickhouseExLogger.Repo,
   url: System.get_env("CLICKHOUSE_URL", "http://localhost:8123"),
   username: System.get_env("CLICKHOUSE_USER", "default"),
   password: System.get_env("CLICKHOUSE_PASSWORD", ""),
-  database: System.get_env("CLICKHOUSE_DATABASE", "logger_dashboard_dev")
+  database: System.get_env("CLICKHOUSE_DATABASE", "cluster_log")
 
 # Dashboard shared-token gate. Predefined via DASHBOARD_AUTH_TOKEN, else a
 # boot-generated ephemeral token (in memory only, rotates on restart).
@@ -134,6 +134,14 @@ if config_env() == :prod do
       # for details about using IPv6 vs IPv4 and loopback vs public addresses.
       ip: {0, 0, 0, 0, 0, 0, 0, 0}
     ],
+    # The compose stack publishes the dashboard on loopback and documents both
+    # `http://localhost:<port>` and `http://127.0.0.1:<port>` as entry points
+    # (same pair `force_ssl` already exempts in config/prod.exs). Phoenix checks
+    # the socket `Origin` against a single host by default, so without this the
+    # LiveView longpoll falls into a reconnect loop from whichever loopback name
+    # is not the URL host. Host-only `//host` entries match any scheme or port,
+    # so custom `DASHBOARD_PORT` values keep working.
+    check_origin: ["//localhost", "//127.0.0.1", "//#{host}"] |> Enum.uniq(),
     secret_key_base: secret_key_base
 
   # ## SSL Support

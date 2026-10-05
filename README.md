@@ -96,8 +96,11 @@ chmod 600 .env
 podman compose up --build
 ```
 
-The dashboard is then on <http://localhost:4000> (`docker compose up --build`
-works identically). Required secrets, and how to generate them:
+The dashboard is then on <http://localhost:5051> (`docker compose up --build`
+works identically). The stack serves the dashboard on `5051` and ClickHouse on
+`8124`/`9001` (loopback only), so it runs alongside dev (`4000`/`8123`)
+without clashing.
+Required secrets, and how to generate them:
 
 | Variable | Generate with |
 | --- | --- |
@@ -127,10 +130,11 @@ configured defaults back in force.
 
 Notes and caveats:
 
-- **ClickHouse ports are loopback-only.** `8123` and `9000` bind to `127.0.0.1`
-  so they are not reachable from another host. To let a remote node ship logs
-  into it, publish the port on a private interface in `compose.yaml` and
-  firewall it.
+- **ClickHouse ports are loopback-only.** In the compose stack `8124` and `9001`
+  bind to `127.0.0.1` (via a mounted server config, since the server defaults
+  are `8123`/`9000`) so they are not reachable from another host. To let a
+  remote node ship logs into it, publish the port on a private interface in
+  `compose.yaml` and firewall it.
 - **Plain HTTP on loopback only.** The release's `force_ssl` exempts just
   `localhost` and `127.0.0.1`; any other hostname over plain HTTP is redirected
   to HTTPS. Terminate TLS in front of the published port for remote access —
@@ -168,7 +172,7 @@ The page states which of the two is in force. "Remove saved policy" deletes the 
 one, so the environment's policy is in force again for this run and every later one.
 The dashboard never rewrites the environment it was deployed with.
 
-Saved policies live in `TASK_CONFIG_DIR` (`/var/lib/logger_dashboard` in the compose
+Saved policies live in `TASK_CONFIG_DIR` (`/app/task_config` in the compose
 stack, on the `task-config-data` volume). That volume is what makes a saved policy
 outlive a redeploy; without it the directory sits in the container's writable layer and
 is lost when the container is recreated. If the directory cannot be written the
@@ -199,7 +203,7 @@ podman run -d --name logger_dashboard -p 4000:4000 \
   logger-dashboard:latest
 ```
 
-The image runs as `nobody`, listens on `$PORT` (default `4000`), and needs no
+The image runs as `nobody`, listens on `$DASHBOARD_PORT` (default `4000`), and needs no
 Elixir or Node at runtime. `SECRET_KEY_BASE` is the only variable required in
 prod — the boot fails naming it when missing. There is no other database: the
 dashboard reads only ClickHouse.
@@ -210,8 +214,8 @@ volume if it has to outlive the container:
 
 ```bash
 podman run -d --name logger_dashboard -p 4000:4000 \
-  -v logger-dashboard-config:/var/lib/logger_dashboard \
-  -e TASK_CONFIG_DIR=/var/lib/logger_dashboard \
+  -v logger-dashboard-config:/app/task_config \
+  -e TASK_CONFIG_DIR=/app/task_config \
   ... logger-dashboard:latest
 ```
 
@@ -256,13 +260,13 @@ requires `--allow-prod`.
 | --- | --- | --- |
 | `DASHBOARD_AUTH_TOKEN` | generated per boot | Shared token for every route. Empty/unset generates an ephemeral one. |
 | `PHX_SERVER` | unset | Set to `true` to serve HTTP (the container sets it). |
-| `PORT` | `4000` | HTTP port. |
+| `DASHBOARD_PORT` | `4000` (`5051` in the compose stack) | HTTP port: same value sets the container listen port and the published host port in compose. |
 | `PHX_HOST` | `example.com` | Public host used for generated URLs. |
 | `SECRET_KEY_BASE` | — | **Required in prod.** Raises at boot when unset. |
-| `CLICKHOUSE_URL` | `http://localhost:8123` | Service URL, e.g. `http://clickhouse:8123`. |
+| `CLICKHOUSE_URL` | `http://localhost:8123` | Service URL; the compose stack uses `http://default:<password>@clickhouse:8124`. |
 | `CLICKHOUSE_USER` | `default` | See the note below — not forwarded to the client. |
 | `CLICKHOUSE_PASSWORD` | empty | See the note below — not forwarded to the client. |
-| `CLICKHOUSE_DATABASE` | `logger_dashboard_dev` | |
+| `CLICKHOUSE_DATABASE` | `cluster_log` | |
 | `TASK_CONFIG_DIR` | `<release dir>/task_config` | Where configuration you save from the UI is kept. Put it on persistent storage. |
 | `RETENTION_ENABLED` | `false` | `true`/`1`/`yes`/`on` arms [scheduled retention](#scheduled-retention) from the environment. |
 | `RETENTION_RUN_AT` | `03:00 UTC` | `HH:MM UTC`. |
@@ -272,7 +276,7 @@ For a ClickHouse that requires authentication, put the credentials in the
 URL's userinfo:
 
 ```
-CLICKHOUSE_URL=http://default:<password>@clickhouse:8123
+CLICKHOUSE_URL=http://default:<password>@clickhouse:8124
 ```
 
 `CLICKHOUSE_USER` and `CLICKHOUSE_PASSWORD` are read into the repo config but
@@ -287,7 +291,7 @@ config :clickhouse_ex_logger, ClickhouseExLogger.Repo,
   url: System.get_env("CLICKHOUSE_URL", "http://localhost:8123"),
   username: System.get_env("CLICKHOUSE_USER", "default"),
   password: System.get_env("CLICKHOUSE_PASSWORD", ""),
-  database: System.get_env("CLICKHOUSE_DATABASE", "logger_dashboard_dev")
+  database: System.get_env("CLICKHOUSE_DATABASE", "cluster_log")
 ```
 
 `ClickhouseExLogger.Repo` is supervised before the Endpoint. Note that a wrong

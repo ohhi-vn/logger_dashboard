@@ -12,19 +12,25 @@
 services:
   clickhouse:
     image: clickhouse/clickhouse-server:26.9
+    # Literal same-port publish needs a listener behind it: the server's
+    # defaults are 8123/9000, so override them with positional config args
+    # (`clickhouse-server --help`: args after `--` rewrite config.xml).
+    # A mounted config file would also work but breaks when the checkout
+    # lives on a path the container VM cannot share.
+    command: ["--", "--http_port=8124", "--tcp_port=9001"]
     # No CLICKHOUSE_USER: the full-privilege `default` user is used with a
     # password, because schema bootstrap issues DDL.
     environment:
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD in .env}
-      CLICKHOUSE_DB: ${CLICKHOUSE_DATABASE:-logger_dashboard}
+      CLICKHOUSE_DB: ${CLICKHOUSE_DATABASE:-cluster_log}
     volumes:
       - clickhouse-data:/var/lib/clickhouse
     ports:
       # Loopback only: for host-local inspection and log producers. Never
       # publish these on a routable interface without reading the caveats in
       # README.md first.
-      - "127.0.0.1:8123:8123"
-      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:8124:8124"
+      - "127.0.0.1:9001:9001"
     healthcheck:
       # The same authenticated connection the dashboard makes, so wrong
       # credentials report unhealthy here instead of surfacing as a failed
@@ -33,7 +39,7 @@ services:
       test:
         [
           "CMD-SHELL",
-          "clickhouse-client --host 127.0.0.1 --user default --password \"$$CLICKHOUSE_PASSWORD\" --query 'SELECT 1'"
+          "clickhouse-client --host 127.0.0.1 --port 9001 --user default --password \"$$CLICKHOUSE_PASSWORD\" --query 'SELECT 1'"
         ]
       interval: 10s
       timeout: 5s
@@ -43,6 +49,7 @@ services:
     restart: unless-stopped
 
   dashboard:
+    image: logger-dashboard:latest
     build:
       context: .
       dockerfile: Containerfile
@@ -69,22 +76,28 @@ services:
       SECRET_KEY_BASE: ${SECRET_KEY_BASE:?set SECRET_KEY_BASE in .env - generate with mix phx.gen.secret}
       DASHBOARD_AUTH_TOKEN: ${DASHBOARD_AUTH_TOKEN:?set DASHBOARD_AUTH_TOKEN in .env - generate with mix logger_dashboard.gen.token}
       PHX_HOST: ${PHX_HOST:-localhost}
+      # Same var drives the release listen port and both sides of the publish
+      # below, so host and container stay literally equal for every override.
+      DASHBOARD_PORT: ${DASHBOARD_PORT:-5051}
       # The credentials ride in the URL, not in CLICKHOUSE_USER/CLICKHOUSE_PASSWORD:
       # AshClickhouse.Connection passes only :url through to the HTTP client, so
       # separate username/password config never reaches the wire and every
       # request would be rejected by a password-protected server. hackney turns
       # URL userinfo into basic auth. See .env.example on safe password
       # characters.
-      CLICKHOUSE_URL: http://default:${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD in .env}@clickhouse:8123
-      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-logger_dashboard}
+      CLICKHOUSE_URL: http://default:${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD in .env}@clickhouse:8124
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-cluster_log}
       # Where the dashboard keeps configuration an operator saves through it —
       # scheduled retention today. On a named volume so a saved policy survives a
-      # redeploy rather than reverting to the environment's defaults.
-      TASK_CONFIG_DIR: ${TASK_CONFIG_DIR:-/var/lib/logger_dashboard}
+      # redeploy rather than reverting to the environment's defaults. The path
+      # sits inside /app because the image creates and chowns it for the
+      # non-root runtime user; a fresh named volume elsewhere would be
+      # root-owned and unwritable.
+      TASK_CONFIG_DIR: ${TASK_CONFIG_DIR:-/app/task_config}
     volumes:
-      - task-config-data:${TASK_CONFIG_DIR:-/var/lib/logger_dashboard}
+      - task-config-data:${TASK_CONFIG_DIR:-/app/task_config}
     ports:
-      - "127.0.0.1:${DASHBOARD_PORT:-4000}:4000"
+      - "127.0.0.1:${DASHBOARD_PORT:-5051}:${DASHBOARD_PORT:-5051}"
     healthcheck:
       # Duplicates the Containerfile probe so `podman compose ps` reports it
       # even when the image is built in the default OCI format and the
@@ -94,10 +107,13 @@ services:
       # curl sends `Accept: */*`, so an unauthenticated probe is redirected to the
       # token page rather than answered. 401 stays accepted for a client that asks for
       # a non-HTML representation.
+      #
+      # `$$` escapes compose interpolation so the container shell expands the
+      # same `DASHBOARD_PORT` the release listens on.
       test:
         [
           "CMD-SHELL",
-          "curl -s -o /dev/null -w '%{http_code}' http://localhost:4000/logs | grep -qE '^(200|302|401)$' || exit 1"
+          "curl -s -o /dev/null -w '%{http_code}' http://localhost:$${DASHBOARD_PORT:-5051}/logs | grep -qE '^(200|302|401)$' || exit 1"
         ]
       interval: 30s
       timeout: 10s

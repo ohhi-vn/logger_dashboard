@@ -7,7 +7,7 @@ Gives operators a single declarative Podman Compose stack — dashboard plus a s
 ## Requirements
 ### Requirement: Single-command stack startup
 
-The system SHALL provide a compose file at the repository root that brings up the dashboard and a single-node ClickHouse, and nothing else, with one command from a clean checkout.
+The system SHALL provide a compose file at the repository root that brings up the dashboard and a single-node ClickHouse, and nothing else, with one command from a clean checkout. The dashboard service SHALL declare a `build` section with context `.` and dockerfile `Containerfile` so `podman compose up --build` builds the image without a prebuilt image present, and the dashboard SHALL serve HTTP on the published dashboard port without any additional manual command.
 
 #### Scenario: Bring the stack up from a clean checkout
 
@@ -29,6 +29,11 @@ The system SHALL provide a compose file at the repository root that brings up th
 - **WHEN** an operator runs `docker compose up --build` instead
 - **THEN** the same services, ordering, and credentials are used
 
+#### Scenario: Build without a prebuilt image
+
+- **WHEN** an operator removes any local `logger-dashboard:latest` image and runs `podman compose up --build` from a clean checkout
+- **THEN** the compose tooling builds the dashboard image from `Containerfile` instead of failing with image-not-found
+
 ### Requirement: ClickHouse storage persists across restarts
 
 The system SHALL store ClickHouse data in a named volume that survives `podman compose down` and container recreation.
@@ -45,17 +50,22 @@ The system SHALL store ClickHouse data in a named volume that survives `podman c
 
 ### Requirement: ClickHouse is reachable only where intended
 
-The system SHALL publish the ClickHouse HTTP and native ports on the host's loopback interface only, keeping the store and its credentials off the network.
+The system SHALL publish the ClickHouse HTTP and native ports on the host's loopback interface only, keeping the store and its credentials off the network. The server SHALL be configured to listen on `8124` (HTTP) and `9001` (native) inside the container, and the published mappings SHALL be literally `127.0.0.1:8124:8124` and `127.0.0.1:9001:9001`. The dashboard SHALL address it as `clickhouse:8124`.
 
 #### Scenario: Published ClickHouse ports are loopback-bound
 
 - **WHEN** an operator inspects the published ports of the running ClickHouse container
-- **THEN** ports `8123` and `9000` are bound to `127.0.0.1` and are not reachable from another host
+- **THEN** host ports `8124` and `9001` are bound to `127.0.0.1` and are not reachable from another host
 
 #### Scenario: Dashboard reaches ClickHouse over the compose network
 
 - **WHEN** the dashboard reads `/logs`, `/analysis`, or `/prune`
-- **THEN** it connects to the ClickHouse service by its compose service name, with no host IP or published port involved
+- **THEN** it connects to the ClickHouse service by its compose service name on port `8124`, with no host IP or published port involved
+
+#### Scenario: Host inspection reaches the server ports
+
+- **WHEN** an operator runs `curl http://127.0.0.1:8124/ping` against the running stack
+- **THEN** the server answers rather than refusing the connection
 
 ### Requirement: Credentials come from an operator-supplied environment file
 
@@ -184,3 +194,41 @@ configured defaults.
 - **WHEN** an operator reads the example environment file
 - **THEN** it lists the variable naming the dashboard's configuration directory and
   states that the directory is backed by a named volume
+
+### Requirement: Dashboard published port matches the release listen port
+
+The system SHALL pass `DASHBOARD_PORT` (default `5051`) into the dashboard container so the release listens on it, and SHALL publish literally `127.0.0.1:${DASHBOARD_PORT:-5051}:${DASHBOARD_PORT:-5051}` (default `5051:5051`), so the documented `http://localhost:5051` works without overriding anything.
+
+#### Scenario: Default stack serves on documented port
+
+- **WHEN** an operator brings the stack up with no `DASHBOARD_PORT` set
+- **THEN** the dashboard is reachable at `http://localhost:5051` and prompts for the shared token instead of refusing the connection
+
+#### Scenario: In-container probe matches the listen port
+
+- **WHEN** the dashboard container is running
+- **THEN** its compose healthcheck probes `http://localhost:5051/logs` (or the configured `DASHBOARD_PORT`) inside the container, the same port the release listens on
+
+### Requirement: Release accepts LiveView socket origins from loopback and configured host
+
+The system SHALL accept Phoenix socket (`/live`, websocket and longpoll) connections whose `Origin` is `localhost`, `127.0.0.1` (any scheme or port), or the configured `PHX_HOST`, while keeping origin checking enabled in the release. Connections from any other origin SHALL still be rejected.
+
+#### Scenario: Dashboard loads over localhost
+
+- **WHEN** an operator opens the dashboard at `http://localhost:<port>` on the release stack
+- **THEN** the LiveView connects without a `Could not check origin` error and the page becomes interactive instead of retrying longpoll mounts
+
+#### Scenario: Dashboard loads over 127.0.0.1
+
+- **WHEN** an operator opens the dashboard at `http://127.0.0.1:<port>` on the release stack
+- **THEN** the LiveView connects without a `Could not check origin` error and the page becomes interactive instead of retrying longpoll mounts
+
+#### Scenario: Dashboard loads over the configured public host
+
+- **WHEN** an operator opens the dashboard at the configured `PHX_HOST` origin
+- **THEN** the LiveView connects without a `Could not check origin` error
+
+#### Scenario: Foreign origins stay rejected
+
+- **WHEN** a socket connection arrives with an `Origin` that is neither a loopback host nor the configured `PHX_HOST`
+- **THEN** the connection is rejected by the origin check

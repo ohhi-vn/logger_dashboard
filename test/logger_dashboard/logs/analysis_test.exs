@@ -133,10 +133,50 @@ defmodule LoggerDashboard.Logs.AnalysisTest do
     end
   end
 
-  test "node_frequency rolls NULL into unknown", %{node: _node} do
-    assert {:ok, filter} = Filter.parse(%{})
-    assert {:ok, result} = Analysis.node_frequency(filter, limit: 1_000)
+  test "node_frequency rolls NULL into unknown", %{node: node} do
+    # Isolate this test's row in a future time window no other writer uses.
+    # AshDyan computes :frequency over a limited row scan, so asserting on a
+    # just-inserted row against the whole shared table flakes as the table
+    # grows, and the server-side async-insert buffer adds a visibility lag on
+    # top. A private window makes the scan deterministic.
+    now = DateTime.truncate(DateTime.utc_now(), :microsecond)
+    message = "null node #{node}"
 
+    assert {:ok, _} =
+             ClickhouseExLogger.Insert.insert([
+               %{
+                 id: Ash.UUID.generate(),
+                 timestamp: DateTime.add(now, 24, :hour),
+                 level: "info",
+                 message: message,
+                 module: "Test",
+                 file: nil,
+                 line: nil,
+                 function: nil,
+                 metadata: %{},
+                 node: nil
+               }
+             ])
+
+    on_exit(fn ->
+      ClickhouseExLogger.Repo.query("DELETE FROM logs WHERE message = ?", [message])
+    end)
+
+    assert {:ok, filter} =
+             Filter.parse(%{
+               "from" => DateTime.to_iso8601(DateTime.add(now, 23, :hour)),
+               "to" => DateTime.to_iso8601(DateTime.add(now, 25, :hour))
+             })
+
+    # Poll until the async-insert buffer flushes our row.
+    wait_until_visible(fn ->
+      case Analysis.node_frequency(filter) do
+        {:ok, %{labels: labels}} -> "unknown" in labels
+        _ -> false
+      end
+    end)
+
+    assert {:ok, result} = Analysis.node_frequency(filter)
     assert "unknown" in result.labels
   end
 
@@ -219,5 +259,18 @@ defmodule LoggerDashboard.Logs.AnalysisTest do
 
   test "split_by_level stays within max_group_by" do
     assert AshDyan.Info.max_group_by(LoggerDashboard.Logs.LogView) >= 1
+  end
+
+  # Polls `fun` until it returns truthy, giving the server-side async-insert
+  # buffer time to flush under parallel-suite load. Fails loudly on timeout so
+  # a genuinely missing row still fails instead of hanging the suite.
+  defp wait_until_visible(fun, attempts \\ 60) do
+    if fun.() do
+      :ok
+    else
+      assert attempts > 0, "inserted rows never became queryable"
+      Process.sleep(500)
+      wait_until_visible(fun, attempts - 1)
+    end
   end
 end

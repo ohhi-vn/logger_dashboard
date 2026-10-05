@@ -43,3 +43,4 @@ npm-debug.log
 .agents
 .expert
 .dexter.db*
+/task_config

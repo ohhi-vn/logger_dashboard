@@ -36,7 +36,7 @@ FROM ${BUILDER_IMAGE} AS builder
 RUN apt-get update -y && apt-get install -y build-essential git ca-certificates nodejs npm \
     && apt-get clean && rm -f /var/lib/apt/lists/*_*
 
-ENV ERL_FLAGS="+JMsingle true"
+# ENV ERL_FLAGS="+JMsingle true"
 
 # prepare build dir
 WORKDIR /app
