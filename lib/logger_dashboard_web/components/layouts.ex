@@ -81,6 +81,17 @@ defmodule LoggerDashboardWeb.Layouts do
           </nav>
 
           <.theme_toggle />
+
+          <%!-- A form post, not a `phx-click`. Signing out has to work in exactly the
+                state where the session is no longer trusted, and that is also the state
+                with no usable socket — so it must not depend on one. It is also the one
+                action that can safely run unauthenticated: it only ever removes access. --%>
+          <form action={~p"/logout"} method="post" class="contents">
+            <input type="hidden" name="_method" value="delete" />
+            <.button id="logout-button" variant="primary" class="btn btn-ghost btn-sm">
+              Sign out
+            </.button>
+          </form>
         </div>
       </header>
 

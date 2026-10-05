@@ -160,6 +160,8 @@ The per-page row count SHALL be selectable from 100, 500, and 3000, and 100 SHAL
 
 A page size carried in the URL that reads as a positive whole number SHALL be honoured, so a page size that is no longer offered but still reachable by an existing link keeps working. A page size above 3000 SHALL be capped at 3000. A page size that does not read as a positive whole number SHALL fall back to 100 rather than being rejected.
 
+Whether further pages exist SHALL be determined from the rows actually matching the active filters, not inferred from the current page being full. A page holding exactly the per-page row count SHALL report that no further pages exist when no further rows match. The rows used to determine this SHALL NOT be shown on the page, so a page holds at most the selected number of rows and an export of that page contains exactly the rows displayed.
+
 #### Scenario: Paginate filtered logs
 
 - **WHEN** user advances to the next page with filters active
@@ -176,6 +178,23 @@ A page size carried in the URL that reads as a positive whole number SHALL be ho
 - **WHEN** a page returns fewer rows than the per-page limit
 - **THEN** system indicates that no further pages exist and offers no way to
   advance past the last page
+
+#### Scenario: A full page at the end of results signals no further pages
+
+- **WHEN** a page holds exactly the per-page row count and no further rows match the
+  active filters
+- **THEN** system indicates that no further pages exist and offers no way to advance
+
+#### Scenario: A full page with more rows behind it offers a next page
+
+- **WHEN** a page holds exactly the per-page row count and further rows match the
+  active filters
+- **THEN** system offers a way to advance to those further rows
+
+#### Scenario: The row used to detect further pages is not shown
+
+- **WHEN** the system determines that further pages exist
+- **THEN** the page still holds at most the selected number of rows
 
 #### Scenario: Page size and scope are preserved when advancing
 

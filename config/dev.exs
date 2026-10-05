@@ -45,6 +45,10 @@ config :logger_dashboard, LoggerDashboardWeb.Endpoint,
 # Enable dev routes for dashboard and mailbox
 config :logger_dashboard, dev_routes: true
 
+# Distinct from the test directory so a `mix phx.server` and a `mix test` run never
+# read each other's stored background-task configuration.
+config :logger_dashboard, task_config_dir: Path.expand("../tmp/dev/task_config", __DIR__)
+
 # Do not include metadata nor timestamps in development logs
 config :logger, :default_formatter, format: "[$level] $message\n"
 

@@ -65,7 +65,7 @@ defmodule Mix.Tasks.LoggerDashboard.SeedLogsTest do
     # async_insert needs a moment to become queryable
     Process.sleep(2_000)
     assert {:ok, filter} = Filter.parse(%{"node" => node})
-    assert {:ok, []} = LoggerDashboard.Logs.LogRead.list_logs(filter)
+    assert {:ok, [], _has_more} = LoggerDashboard.Logs.LogRead.list_logs(filter)
 
     capture_io(fn ->
       Mix.Tasks.LoggerDashboard.SeedLogs.run([
@@ -86,7 +86,7 @@ defmodule Mix.Tasks.LoggerDashboard.SeedLogsTest do
 
     Process.sleep(2_000)
     assert {:ok, filter} = Filter.parse(%{"node" => node})
-    assert {:ok, rows} = LoggerDashboard.Logs.LogRead.list_logs(filter)
+    assert {:ok, rows, _has_more} = LoggerDashboard.Logs.LogRead.list_logs(filter)
     assert length(rows) == 20
   end
 end

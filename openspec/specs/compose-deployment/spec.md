@@ -5,7 +5,6 @@
 Gives operators a single declarative Podman Compose stack — dashboard plus a single-node ClickHouse — that builds the release image, provisions credentials, applies the ClickHouse schema before serving, and persists logs, so a working deployment needs no hand-assembled container commands and no Postgres instance.
 
 ## Requirements
-
 ### Requirement: Single-command stack startup
 
 The system SHALL provide a compose file at the repository root that brings up the dashboard and a single-node ClickHouse, and nothing else, with one command from a clean checkout.
@@ -152,3 +151,36 @@ The system SHALL document that the stack serves plain HTTP, and that the release
 
 - **WHEN** an operator opens the dashboard by any other host name or address over plain HTTP
 - **THEN** the release responds with a redirect to HTTPS, and the README states that TLS must be terminated in front of the published port
+
+### Requirement: Dashboard operational configuration persists across recreation
+
+The system SHALL store the dashboard's operational configuration in a named volume
+that survives `podman compose down` and container recreation, so configuration an
+operator saved through the dashboard is still in force after a redeploy.
+
+Removing the volumes SHALL remove that configuration, returning the dashboard to its
+configured defaults.
+
+#### Scenario: Saved configuration survives a redeploy
+
+- **WHEN** an operator saves dashboard configuration, runs `podman compose down`, and
+  later runs `podman compose up`
+- **THEN** the saved configuration is still in force
+
+#### Scenario: Configuration is deleted only on explicit volume removal
+
+- **WHEN** an operator runs `podman compose down --volumes`
+- **THEN** the saved dashboard configuration is destroyed and the dashboard returns to
+  its configured defaults
+
+#### Scenario: The stack still declares no additional service
+
+- **WHEN** an operator inspects the running stack after this change
+- **THEN** the only services are the dashboard and ClickHouse; the configuration store
+  is a volume on the dashboard service, not a new service
+
+#### Scenario: The example environment file documents the store location
+
+- **WHEN** an operator reads the example environment file
+- **THEN** it lists the variable naming the dashboard's configuration directory and
+  states that the directory is backed by a named volume

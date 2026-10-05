@@ -14,8 +14,12 @@ defmodule LoggerDashboard.Application do
       ClickhouseExLogger.Repo,
       {DNSCluster, query: Application.get_env(:logger_dashboard, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: LoggerDashboard.PubSub},
-      # Start a worker by calling: LoggerDashboard.Worker.start_link(arg)
-      # {LoggerDashboard.Worker, arg},
+      # Before the scheduler, which reads its policy out of this during `init/1`.
+      # After the Repo, since the scheduler issues deletes through it. Under
+      # `:one_for_one`, placing it after the Repo means a Repo restart replaces the
+      # Repo alone and leaves the scheduler — and the policy it loaded — running.
+      LoggerDashboard.BackgroundTaskConfig,
+      LoggerDashboard.Retention.Scheduler,
       # Start to serve requests, typically the last entry
       LoggerDashboardWeb.Endpoint
     ]

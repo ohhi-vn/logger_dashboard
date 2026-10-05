@@ -200,10 +200,13 @@ defmodule LoggerDashboardWeb.LogLive.Index do
 
   defp load_logs(socket, filter) do
     case LogRead.list_logs(filter) do
-      {:ok, rows} ->
+      # `has_next` comes from the read path rather than from the length of this
+      # page: a page that is exactly full is not evidence that more rows exist,
+      # and inferring it that way leaves a next page leading to an empty one.
+      {:ok, rows, has_next} ->
         socket
         |> assign(:logs_error, nil)
-        |> assign(:has_next, length(rows) >= filter.limit)
+        |> assign(:has_next, has_next)
         |> assign(:page_rows, rows)
         |> stream(:logs, rows, reset: true)
 

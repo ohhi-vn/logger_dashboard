@@ -86,7 +86,7 @@ defmodule LoggerDashboard.Logs.Prune do
     if scope == :node and filter.nodes == [] do
       {:error, "Select a node to prune, or choose whole-system scope."}
     else
-      {where_sql, params} = where_clause(filter, scope)
+      {where_sql, params} = where_clause(filter)
 
       table = qualified_table()
       sql = "ALTER TABLE #{table} DELETE WHERE #{where_sql}"
@@ -104,14 +104,13 @@ defmodule LoggerDashboard.Logs.Prune do
   end
 
   @doc false
-  @spec where_clause(Filter.t(), :node | :all) :: {String.t(), list()}
-  def where_clause(%Filter{} = filter, scope) do
-    # `parse/1` already folds scope into the filter: a node scope carries the
-    # node value, a whole-system scope carries `""`. `Filter.predicates/1` then
-    # emits `node = ?` only when that value is present, so the scope argument
-    # needs no separate handling. Message is excluded because `parse/1` forces
-    # `search: ""`, which yields no `message LIKE ?` clause.
-    _ = scope
+  @spec where_clause(Filter.t()) :: {String.t(), list()}
+  def where_clause(%Filter{} = filter) do
+    # Scope needs no argument here because `parse/1` already folds it into the
+    # filter: a node scope carries the node value, a whole-system scope carries
+    # `""`. `Filter.predicates/1` then emits `node = ?` only when that value is
+    # present. Message is excluded because `parse/1` forces `search: ""`, which
+    # yields no `message LIKE ?` clause.
     Filter.predicates(filter)
   end
 

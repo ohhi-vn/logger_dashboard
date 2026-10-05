@@ -15,6 +15,10 @@
 #
 # Run:
 #   podman run -d --name logger_dashboard -p 4000:4000 logger-dashboard:latest
+#
+# Configuration the dashboard saves (scheduled retention) is written to
+# /app/task_config by default. Pass TASK_CONFIG_DIR to put it elsewhere — on a
+# volume, if the saved configuration has to survive recreating the container.
 
 ARG ELIXIR_VERSION=1.20.4
 ARG OTP_VERSION=29
@@ -106,6 +110,12 @@ ENV MIX_ENV="prod"
 
 COPY --from=builder --chown=nobody:root /app/_build/${MIX_ENV}/rel/logger_dashboard ./
 
+# Where the dashboard keeps configuration an operator saves through it (scheduled
+# retention today). Created here and owned by the runtime user so a container started
+# with no TASK_CONFIG_DIR can still persist it; TASK_CONFIG_DIR overrides the location,
+# which is what the compose stack does so the directory lands on a named volume.
+RUN mkdir -p /app/task_config && chown nobody /app/task_config
+
 # Make migration script executable
 RUN chmod +x /app/bin/migrate 2>/dev/null || true
 
@@ -118,10 +128,12 @@ USER nobody
 ENV PHX_SERVER=true
 
 # Health check for container orchestration.
-# Every route sits behind the shared-token gate, so a 401 is the expected answer
-# from a running server; what this rejects is a container that is up but no longer
-# accepting connections.
+# Every route sits behind the shared-token gate, and curl sends `Accept: */*`, so an
+# unauthenticated probe is redirected to the token page. 302 is therefore the expected
+# answer from a running server; what this rejects is a container that is up but no
+# longer accepting connections. 401 stays accepted for a client that asks for a
+# non-HTML representation, which the gate refuses without a login page.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-  CMD curl -s -o /dev/null -w '%{http_code}' http://localhost:4000/logs | grep -qE '^(200|401)$' || exit 1
+  CMD curl -s -o /dev/null -w '%{http_code}' http://localhost:4000/logs | grep -qE '^(200|302|401)$' || exit 1
 
 CMD ["/app/bin/logger_dashboard", "start"]

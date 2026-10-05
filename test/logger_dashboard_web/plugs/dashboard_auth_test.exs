@@ -1,116 +1,209 @@
 defmodule LoggerDashboardWeb.Plugs.DashboardAuthTest do
   use ExUnit.Case, async: false
 
+  import Plug.Conn
   import Plug.Test
 
-  alias LoggerDashboardWeb.Plugs.DashboardAuth
-
-  @opts DashboardAuth.init([])
+  alias LoggerDashboard.DashboardAuth
+  alias LoggerDashboardWeb.Plugs.DashboardAuth, as: Gate
 
   setup do
-    previous = Application.get_env(:logger_dashboard, :dashboard_auth_token)
-    Application.put_env(:logger_dashboard, :dashboard_auth_token, "plug-test-token")
+    token = "plug-test-token"
+    Application.put_env(:logger_dashboard, :dashboard_auth_token, token)
+    on_exit(fn -> Application.delete_env(:logger_dashboard, :dashboard_auth_token) end)
 
-    on_exit(fn ->
-      if is_nil(previous) do
-        Application.delete_env(:logger_dashboard, :dashboard_auth_token)
-      else
-        Application.put_env(:logger_dashboard, :dashboard_auth_token, previous)
-      end
-    end)
-
-    :ok
+    %{token: token}
   end
 
-  test "missing credentials are rejected with a Basic challenge" do
-    conn = conn(:get, "/logs") |> init_test_session(%{}) |> DashboardAuth.call(@opts)
-
-    assert conn.status == 401
-    assert conn.halted
-
-    assert Plug.Conn.get_resp_header(conn, "www-authenticate") == [
-             ~s(Basic realm="logger_dashboard")
-           ]
-
-    assert conn.resp_body == "Unauthorized"
-  end
-
-  test "wrong Bearer token is rejected without distinguishing reason" do
-    conn =
-      conn(:get, "/logs")
-      |> Plug.Conn.put_req_header("authorization", "Bearer wrong")
-      |> init_test_session(%{})
-      |> DashboardAuth.call(@opts)
-
-    assert conn.status == 401
-    assert conn.halted
-    refute conn.resp_body =~ "plug-test-token"
-    refute conn.resp_body =~ "wrong"
-  end
-
-  test "valid Bearer token passes and marks the session" do
-    conn =
-      conn(:get, "/logs")
-      |> Plug.Conn.put_req_header("authorization", "Bearer plug-test-token")
-      |> init_test_session(%{})
-      |> DashboardAuth.call(@opts)
-
-    refute conn.halted
-    assert conn.assigns[:dashboard_authenticated] == true
-    assert Plug.Conn.get_session(conn, :dashboard_authenticated) == true
-  end
-
-  test "valid Basic password passes regardless of username" do
-    credentials = Base.encode64("anyone:plug-test-token")
-
-    conn =
-      conn(:get, "/logs")
-      |> Plug.Conn.put_req_header("authorization", "Basic #{credentials}")
-      |> init_test_session(%{})
-      |> DashboardAuth.call(@opts)
-
-    refute conn.halted
-  end
-
-  test "wrong Basic password is rejected" do
-    credentials = Base.encode64("anyone:wrong")
-
-    conn =
-      conn(:get, "/logs")
-      |> Plug.Conn.put_req_header("authorization", "Basic #{credentials}")
-      |> init_test_session(%{})
-      |> DashboardAuth.call(@opts)
-
-    assert conn.status == 401
-  end
-
-  test "malformed Authorization header is rejected" do
-    for header <- ["Bearer ", "Basic !!!", "Token abc", ""] do
+  describe "call/2 with a session" do
+    test "a session whose digest matches the current token passes" do
       conn =
-        conn(:get, "/logs")
-        |> Plug.Conn.put_req_header("authorization", header)
-        |> init_test_session(%{})
-        |> DashboardAuth.call(@opts)
+        :get
+        |> conn("/logs")
+        |> init_test_session(%{dashboard_auth_digest: DashboardAuth.digest()})
+        |> Gate.call([])
 
-      assert conn.status == 401, "expected 401 for #{inspect(header)}"
+      refute conn.halted
+      assert conn.assigns[:dashboard_authenticated]
+    end
+
+    test "a session whose digest does not match is refused" do
+      # The shape of a session established under a token that has since been replaced.
+      # Everything about it is well-formed; only the digest is stale.
+      conn =
+        :get
+        |> conn("/logs")
+        |> init_test_session(%{
+          dashboard_auth_digest:
+            :crypto.hash(:sha256, "a-previous-token") |> Base.encode16(case: :lower)
+        })
+        |> Gate.call([])
+
+      assert conn.halted
+      assert conn.status == 302
+    end
+
+    test "no session is refused" do
+      conn =
+        :get
+        |> conn("/logs")
+        |> init_test_session(%{})
+        |> Gate.call([])
+
+      assert conn.halted
+      assert conn.status == 302
+    end
+
+    test "the redirect remembers where the request was going" do
+      conn =
+        :get
+        |> conn("/prune")
+        |> init_test_session(%{})
+        |> Gate.call([])
+
+      # Written into the session rather than the URL, so the token page has no
+      # request-controlled redirect target to validate.
+      assert Plug.Conn.get_session(conn, :dashboard_auth_return_to) == "/prune"
+      assert get_resp_header(conn, "location") == ["/login"]
+    end
+
+    test "an invalid digest is refused whatever it contains" do
+      for recorded <- [nil, "", "plug-test-token", 123, :atom] do
+        conn =
+          :get
+          |> conn("/logs")
+          |> init_test_session(%{dashboard_auth_digest: recorded})
+          |> Gate.call([])
+
+        assert conn.halted, "expected #{inspect(recorded)} to be refused"
+      end
     end
   end
 
-  test "on_mount allows authenticated sessions and halts others" do
-    socket = %Phoenix.LiveView.Socket{}
+  describe "how the refusal is delivered" do
+    test "a browser is redirected to the token page" do
+      conn =
+        :get
+        |> conn("/logs")
+        |> put_req_header("accept", "text/html,application/xhtml+xml")
+        |> init_test_session(%{})
+        |> Gate.call([])
 
-    assert {:cont, _} =
-             DashboardAuth.on_mount(:default, %{}, %{"dashboard_authenticated" => true}, socket)
+      assert conn.halted
+      assert conn.status == 302
+      assert get_resp_header(conn, "location") == ["/login"]
+    end
 
-    assert {:cont, _} =
-             DashboardAuth.on_mount(
-               :ensure_authenticated,
-               %{},
-               %{dashboard_authenticated: true},
-               socket
-             )
+    test "a client that does not accept HTML gets a bare 401" do
+      conn =
+        :get
+        |> conn("/logs")
+        |> put_req_header("accept", "application/json")
+        |> init_test_session(%{})
+        |> Gate.call([])
 
-    assert {:halt, _} = DashboardAuth.on_mount(:default, %{}, %{}, socket)
-    assert {:halt, _} = DashboardAuth.on_mount(:default, %{}, nil, socket)
+      assert conn.halted
+      assert conn.status == 401
+      assert conn.resp_body == "Unauthorized"
+      # No login page: a script is not a browser, and an HTML body here would be a page
+      # it cannot use.
+      refute conn.resp_body =~ "login-form"
+    end
+
+    test "a missing accept header is treated as a browser" do
+      # The gate runs before `:accepts`, so it is the only place the question gets asked,
+      # and the default has to be the useful one.
+      conn =
+        :get
+        |> conn("/logs")
+        |> delete_req_header("accept")
+        |> init_test_session(%{})
+        |> Gate.call([])
+
+      assert conn.status == 302
+    end
+
+    test "a wildcard accept header is treated as a browser" do
+      # What curl sends. A redirect it can follow with `-L` is more useful than a status.
+      conn =
+        :get
+        |> conn("/logs")
+        |> put_req_header("accept", "*/*")
+        |> init_test_session(%{})
+        |> Gate.call([])
+
+      assert conn.status == 302
+    end
+
+    test "no refusal carries a WWW-Authenticate header" do
+      # The whole point: a challenge here would send a browser straight back to the
+      # dialog this gate replaced.
+      for accept <- ["text/html", "application/json", "*/*"] do
+        conn =
+          :get
+          |> conn("/logs")
+          |> put_req_header("accept", accept)
+          |> init_test_session(%{})
+          |> Gate.call([])
+
+        assert get_resp_header(conn, "www-authenticate") == [],
+               "unexpected challenge for accept #{accept}"
+      end
+    end
   end
+
+  describe "an Authorization header does not authenticate" do
+    test "neither Bearer nor Basic is honoured" do
+      credentials = [
+        "Bearer plug-test-token",
+        "Basic " <> Base.encode64("anyone:plug-test-token")
+      ]
+
+      for header <- credentials do
+        conn =
+          :get
+          |> conn("/logs")
+          |> put_req_header("authorization", header)
+          |> init_test_session(%{})
+          |> Gate.call([])
+
+        assert conn.halted, "expected #{header} to be ignored"
+        assert conn.status == 302
+      end
+    end
+  end
+
+  describe "on_mount/4" do
+    test "allows a session whose digest matches" do
+      session = %{"dashboard_auth_digest" => DashboardAuth.digest()}
+
+      assert {:cont, _socket} = Gate.on_mount(:default, %{}, session, socket())
+    end
+
+    test "halts a session whose digest does not match" do
+      # The string key, which is what a cookie round-trip leaves behind. An atom-key
+      # lookup on that map finds nothing and turns every authenticated socket into a
+      # redirect loop.
+      session = %{"dashboard_auth_digest" => Base.encode16(:crypto.hash(:sha256, "stale"))}
+
+      assert {:halt, _socket} = Gate.on_mount(:default, %{}, session, socket())
+    end
+
+    test "accepts the atom key form too" do
+      session = %{dashboard_auth_digest: DashboardAuth.digest()}
+
+      assert {:cont, _socket} = Gate.on_mount(:default, %{}, session, socket())
+    end
+
+    test "halts an empty session and sends the operator to the token page" do
+      assert {:halt, socket} = Gate.on_mount(:default, %{}, %{}, socket())
+      assert socket.redirected == {:redirect, %{to: "/login", status: 302}}
+    end
+
+    test "halts a nil session" do
+      assert {:halt, _socket} = Gate.on_mount(:default, %{}, nil, socket())
+    end
+  end
+
+  defp socket, do: struct(%Phoenix.LiveView.Socket{}, __struct__: Phoenix.LiveView.Socket)
 end

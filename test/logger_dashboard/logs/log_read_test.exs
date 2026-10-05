@@ -68,7 +68,7 @@ defmodule LoggerDashboard.Logs.LogReadTest do
     test "returns rows typed as the viewer expects", %{tag: tag} do
       seed(tag, "raw read typing", :info, ~U[2026-01-01 00:00:00.000000Z])
 
-      {:ok, [row | _]} = LogRead.list_logs(%Filter{nodes: [tag], search: "*raw read*"})
+      {:ok, [row | _], _has_more} = LogRead.list_logs(%Filter{nodes: [tag], search: "*raw read*"})
 
       assert row.node == tag
       assert is_binary(row.id)
@@ -84,7 +84,7 @@ defmodule LoggerDashboard.Logs.LogReadTest do
       for i <- 1..60, do: seed(tag, "noise #{i}", :info, DateTime.add(base, i, :minute))
       seed(tag, "the ancient needle", :error, base)
 
-      {:ok, rows} =
+      {:ok, rows, _has_more} =
         LogRead.list_logs(%Filter{nodes: [tag], search: "*ancient needle*", limit: 50})
 
       assert Enum.map(rows, & &1.message) == ["the ancient needle"]
@@ -97,15 +97,17 @@ defmodule LoggerDashboard.Logs.LogReadTest do
       seed(tag, "new error", :error, ~U[2026-06-01 00:00:00.000000Z])
       seed(tag, "new info", :info, ~U[2026-06-01 00:00:00.000000Z])
 
-      {:ok, rows} = LogRead.list_logs(%Filter{nodes: [tag], level: "error"})
+      {:ok, rows, _has_more} = LogRead.list_logs(%Filter{nodes: [tag], level: "error"})
       assert Enum.map(rows, & &1.message) == ["new error", "old error"]
 
-      {:ok, rows} =
+      {:ok, rows, _has_more} =
         LogRead.list_logs(%Filter{nodes: [tag], from: ~U[2026-03-01 00:00:00.000000Z]})
 
       assert Enum.sort(Enum.map(rows, & &1.message)) == ["new error", "new info"]
 
-      {:ok, rows} = LogRead.list_logs(%Filter{nodes: [tag], to: ~U[2026-03-01 00:00:00.000000Z]})
+      {:ok, rows, _has_more} =
+        LogRead.list_logs(%Filter{nodes: [tag], to: ~U[2026-03-01 00:00:00.000000Z]})
+
       assert Enum.map(rows, & &1.message) == ["old error"]
     end
 
@@ -115,18 +117,103 @@ defmodule LoggerDashboard.Logs.LogReadTest do
       end
 
       # Row 5 is newest (offset by 5 days), so DESC yields 5, 4, 3, 2, 1.
-      {:ok, first} = LogRead.list_logs(%Filter{nodes: [tag], limit: 2})
+      {:ok, first, _has_more} = LogRead.list_logs(%Filter{nodes: [tag], limit: 2})
       assert Enum.map(first, & &1.message) == ["page row 5", "page row 4"]
 
-      {:ok, second} = LogRead.list_logs(%Filter{nodes: [tag], limit: 2, offset: 2})
+      {:ok, second, _has_more} = LogRead.list_logs(%Filter{nodes: [tag], limit: 2, offset: 2})
       assert Enum.map(second, & &1.message) == ["page row 3", "page row 2"]
 
-      {:ok, third} = LogRead.list_logs(%Filter{nodes: [tag], limit: 2, offset: 4})
+      {:ok, third, _has_more} = LogRead.list_logs(%Filter{nodes: [tag], limit: 2, offset: 4})
       assert Enum.map(third, & &1.message) == ["page row 1"]
     end
 
     test "returns an empty list when nothing matches", %{tag: tag} do
-      assert {:ok, []} = LogRead.list_logs(%Filter{nodes: ["no-such-node-#{tag}"], search: "*x*"})
+      assert {:ok, [], _has_more} =
+               LogRead.list_logs(%Filter{nodes: ["no-such-node-#{tag}"], search: "*x*"})
+    end
+
+    test "reports no further rows when the match count is exactly the page size", %{tag: tag} do
+      # The boundary the inference `length(rows) >= limit` got wrong: a total that
+      # is an exact multiple of the page size fills the last page and has nothing
+      # behind it, so it must report no next page rather than leading to an empty
+      # one.
+      for i <- 1..4,
+          do:
+            seed(
+              tag,
+              "exact #{i}",
+              :info,
+              DateTime.add(~U[2026-01-01 00:00:00.000000Z], i, :minute)
+            )
+
+      assert {:ok, rows, has_more} = LogRead.list_logs(%Filter{nodes: [tag], limit: 4})
+
+      assert length(rows) == 4
+      refute has_more
+    end
+
+    test "reports a further page when exactly one row sits past the page size", %{tag: tag} do
+      for i <- 1..5,
+          do:
+            seed(
+              tag,
+              "beyond #{i}",
+              :info,
+              DateTime.add(~U[2026-01-01 00:00:00.000000Z], i, :minute)
+            )
+
+      assert {:ok, rows, has_more} = LogRead.list_logs(%Filter{nodes: [tag], limit: 4})
+
+      assert length(rows) == 4
+      assert has_more
+    end
+
+    test "never returns the detection row", %{tag: tag} do
+      # The row fetched past the page exists only to answer `has_more`. It must not
+      # reach the caller, because the caller displays and exports exactly this list.
+      for i <- 1..5,
+          do:
+            seed(
+              tag,
+              "probe #{i}",
+              :info,
+              DateTime.add(~U[2026-01-01 00:00:00.000000Z], i, :minute)
+            )
+
+      assert {:ok, rows, has_more} = LogRead.list_logs(%Filter{nodes: [tag], limit: 4})
+
+      assert has_more
+      assert length(rows) == 4
+      refute Enum.any?(rows, &(&1.message == "probe 1"))
+    end
+
+    test "the detection row does not shift the next page", %{tag: tag} do
+      # Advancing must not skip or repeat a row: the probe is consumed by the page
+      # that fetched it, not carried into the following offset.
+      for i <- 1..5,
+          do:
+            seed(
+              tag,
+              "sequence #{i}",
+              :info,
+              DateTime.add(~U[2026-01-01 00:00:00.000000Z], i, :minute)
+            )
+
+      assert {:ok, first, _} = LogRead.list_logs(%Filter{nodes: [tag], limit: 4})
+
+      assert {:ok, second, has_more} =
+               LogRead.list_logs(%Filter{nodes: [tag], limit: 4, offset: 4})
+
+      refute has_more
+
+      assert Enum.map(first, & &1.message) == [
+               "sequence 5",
+               "sequence 4",
+               "sequence 3",
+               "sequence 2"
+             ]
+
+      assert Enum.map(second, & &1.message) == ["sequence 1"]
     end
 
     test "reads rows from two selected nodes and excludes a third", %{tag: tag} do
@@ -146,7 +233,7 @@ defmodule LoggerDashboard.Logs.LogReadTest do
       seed(other, "multi node b", :info, DateTime.add(base, 1, :minute))
       seed(excluded, "multi node c", :info, DateTime.add(base, 2, :minute))
 
-      assert {:ok, rows} =
+      assert {:ok, rows, _has_more} =
                LogRead.list_logs(%Filter{
                  nodes: [tag, other],
                  search: "*multi node*",
@@ -157,7 +244,7 @@ defmodule LoggerDashboard.Logs.LogReadTest do
       refute Enum.any?(rows, &(&1.message == "multi node c"))
 
       # Dropping one node from the set drops exactly its rows.
-      assert {:ok, rows} =
+      assert {:ok, rows, _has_more} =
                LogRead.list_logs(%Filter{nodes: [other], search: "*multi node*", limit: 50})
 
       assert Enum.map(rows, & &1.message) == ["multi node b"]

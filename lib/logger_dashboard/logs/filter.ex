@@ -37,6 +37,12 @@ defmodule LoggerDashboard.Logs.Filter do
   # because both readings want a "7d": "last 7 days" and "older than 7 days" are
   # different ranges, so a bare `7d` would be ambiguous. Preset ids are
   # therefore namespaced as `"<family>:<id>"` — see `preset_id/2`.
+  #
+  # `age` carries hour-valued entries because an operator pruning by hand needs
+  # sub-day cutoffs ("clear the last hour's errors") and the scheduled
+  # retention policy is specified in the same units. Both surfaces read this one
+  # list, so a named duration resolves to the same cutoff wherever it is applied;
+  # a second vocabulary for retention would let the two drift apart.
   @presets %{
     "window" => [
       {"10m", {10, :minute}},
@@ -46,6 +52,9 @@ defmodule LoggerDashboard.Logs.Filter do
       {"7d", {7, :day}}
     ],
     "age" => [
+      {"1h", {1, :hour}},
+      {"6h", {6, :hour}},
+      {"12h", {12, :hour}},
       {"1d", {1, :day}},
       {"3d", {3, :day}},
       {"7d", {7, :day}},

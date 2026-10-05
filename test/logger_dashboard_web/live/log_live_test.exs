@@ -791,6 +791,86 @@ defmodule LoggerDashboardWeb.LogLiveTest do
     end
   end
 
+  describe "index pagination boundary" do
+    @describetag :clickhouse
+
+    setup %{conn: conn} do
+      tag = "logpage-#{System.system_time(:millisecond)}-#{:rand.uniform(1_000_000)}@host"
+      base = ~U[2026-01-01 00:00:00.000000Z]
+
+      rows =
+        for i <- 1..4 do
+          %{
+            id: Ash.UUID.generate(),
+            timestamp: DateTime.add(base, i, :hour),
+            level: "info",
+            message: "logpage row #{String.pad_leading(to_string(i), 3, "0")}",
+            module: "Test",
+            file: nil,
+            line: nil,
+            function: nil,
+            metadata: %{},
+            node: tag
+          }
+        end
+
+      {:ok, _} = ClickhouseExLogger.Insert.insert(rows)
+
+      on_exit(fn -> ClickhouseExLogger.Repo.query("DELETE FROM logs WHERE node = ?", [tag]) end)
+
+      {:ok, conn: conn, tag: tag}
+    end
+
+    test "a full last page offers no Next", %{conn: conn, tag: tag} do
+      # Four matching rows on a page of four. The page is full, so inferring from
+      # its length would offer Next and lead to an empty page; there is nothing
+      # behind it, so Next must be absent.
+      {:ok, lv, _html} = live(conn, ~p"/logs?node=#{tag}&limit=4")
+
+      assert lv |> element("#logs-pagination") |> render() =~ "Offset 0 · Limit 4"
+      refute has_element?(lv, "#logs-next:not([disabled])")
+    end
+
+    test "a full page with one row behind it offers Next", %{conn: conn, tag: tag} do
+      # One row past the page is the smallest case that still has a next page.
+      {:ok, lv, _html} = live(conn, ~p"/logs?node=#{tag}&limit=3")
+
+      assert has_element?(lv, "#logs-next:not([disabled])")
+
+      lv |> element("#logs-next") |> render_click()
+
+      assert lv |> element("#logs-pagination") |> render() =~ "Offset 3 · Limit 3"
+      assert render(lv) =~ "logpage row 001"
+      refute has_element?(lv, "#logs-next:not([disabled])")
+    end
+
+    test "the detection row is neither streamed nor exported", %{conn: conn, tag: tag} do
+      # The row fetched past the page exists only to learn that a next page
+      # exists. Reaching either the page or the export would contradict the rule
+      # that both carry exactly the page size.
+      {:ok, lv, _html} = live(conn, ~p"/logs?node=#{tag}&limit=3")
+
+      # Counted through LazyHTML so the assertion names the rows it depends on
+      # rather than the markup around them.
+      streamed =
+        lv
+        |> element("#logs-list")
+        |> render()
+        |> LazyHTML.from_fragment()
+        |> LazyHTML.query("article[data-role=log-line]")
+        |> Enum.count()
+
+      assert streamed == 3
+
+      lv |> element("#logs-export") |> render_click()
+
+      assert_push_event(lv, "logs-download", %{body: body})
+
+      assert body |> String.split("\n") |> length() == 3
+      refute body =~ "logpage row 001"
+    end
+  end
+
   describe "index export of an empty page" do
     test "succeeds with no rows and leaves the page unchanged", %{conn: conn} do
       # A node with no rows guarantees an empty page regardless of what else

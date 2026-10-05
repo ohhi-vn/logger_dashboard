@@ -21,7 +21,7 @@ if System.get_env("PHX_SERVER") do
 end
 
 config :logger_dashboard, LoggerDashboardWeb.Endpoint,
-  http: [port: String.to_integer(System.get_env("PORT", "4000"))]
+  http: [port: String.to_integer(System.get_env("DASHBOARD_PORT", "4000"))]
 
 config :clickhouse_ex_logger, ClickhouseExLogger.Repo,
   url: System.get_env("CLICKHOUSE_URL", "http://localhost:8123"),
@@ -92,6 +92,38 @@ if config_env() == :prod do
   host = System.get_env("PHX_HOST") || "example.com"
 
   config :logger_dashboard, :dns_cluster_query, System.get_env("DNS_CLUSTER_QUERY")
+
+  # Directory the background-task configuration store keeps its file in. Configuration
+  # an operator saved through the dashboard survives an application restart only while
+  # this is on storage that outlives the container, which is why the compose stack
+  # mounts a named volume here.
+  #
+  # The default sits beside the release rather than in the system temp directory,
+  # because the release directory is owned by the runtime user and a tmp path would be
+  # wiped under a redeploy. An unwritable value is not fatal: the dashboard starts and
+  # background tasks use their configured defaults, reporting the failure on the pages
+  # that show their configuration.
+  config :logger_dashboard,
+    task_config_dir: System.get_env("TASK_CONFIG_DIR") || Path.join(File.cwd!(), "task_config")
+
+  # Retention policy, overridable per deployment. Any of these being unset or blank
+  # leaves the feature off, so the compose stack needs no retention variables to
+  # start cleanly.
+  #
+  # This is the value in force until something is stored: the prune page can store a
+  # policy for the running system, and a stored policy outranks this one and survives
+  # a restart. Reverting from the page removes the stored policy, which is what brings
+  # this value back.
+  #
+  # `keep` must name an entry of the `:age` family; an unrecognised value disables
+  # the feature rather than failing the boot, so a typo cannot take the dashboard
+  # down.
+  config :logger_dashboard,
+    retention: [
+      enabled: System.get_env("RETENTION_ENABLED", "false") in ~w(true 1 yes on),
+      run_at: System.get_env("RETENTION_RUN_AT", "03:00 UTC"),
+      keep: System.get_env("RETENTION_KEEP", "7d")
+    ]
 
   config :logger_dashboard, LoggerDashboardWeb.Endpoint,
     url: [host: host, port: 443, scheme: "https"],

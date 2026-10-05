@@ -206,6 +206,9 @@ defmodule LoggerDashboard.Logs.FilterTest do
 
     test "age family is a retention cutoff that sets only the upper bound" do
       assert Filter.presets(:age) == [
+               {"1h", {1, :hour}},
+               {"6h", {6, :hour}},
+               {"12h", {12, :hour}},
                {"1d", {1, :day}},
                {"3d", {3, :day}},
                {"7d", {7, :day}},
@@ -219,9 +222,25 @@ defmodule LoggerDashboard.Logs.FilterTest do
       age_ids = for {id, _} <- Filter.presets(:age), do: id
 
       # "last 7 days" and "older than 7 days" are different ranges, so the
-      # families must stay distinguishable by id.
-      assert window_ids -- age_ids == ["10m", "1h", "6h", "24h"]
-      assert age_ids -- window_ids == ["1d", "3d", "30d", "90d"]
+      # families must stay distinguishable by id. The ids are namespaced
+      # precisely because "1h" appears in both: as a lookback it is the last
+      # hour, as an age it is everything older than an hour ago.
+      assert window_ids -- age_ids == ["10m", "24h"]
+      assert age_ids -- window_ids == ["12h", "1d", "3d", "30d", "90d"]
+    end
+
+    test "each family is ordered shortest-first" do
+      # The prune page renders the list in order, so an unsorted family would
+      # present "90d" before "1h".
+      for family <- [:window, :age] do
+        durations = for {_id, {amount, unit}} <- Filter.presets(family), do: {amount, unit}
+        units = Enum.map(durations, &elem(&1, 1))
+
+        assert durations ==
+                 Enum.sort_by(durations, fn {amount, unit} -> {unit_index(unit), amount} end)
+
+        assert units == Enum.sort(units, &(unit_index(&1) <= unit_index(&2)))
+      end
     end
 
     test "preset_id/2 namespaces an id with its family" do
@@ -268,11 +287,30 @@ defmodule LoggerDashboard.Logs.FilterTest do
     end
 
     test "an unrecognized preset is rejected and names the offered ids" do
-      for bad <- ["1h", "window", "window:", "window:2h", "age:1h", "month:1m", "window:1h:x"] do
+      for bad <- ["1h", "window", "window:", "window:2h", "age:2h", "month:1m", "window:1h:x"] do
         assert {:error, message} = Filter.resolve_preset(bad, @now)
         assert message =~ "invalid preset"
         assert message =~ ~s("window:1h")
       end
+    end
+
+    test "an hour-valued age preset resolves to a sub-day cutoff" do
+      # Retention is specified in hours as well as days, so `age:1h` has to be a
+      # real cutoff an hour before now rather than a rejected id.
+      assert {:ok, {nil, cutoff}} = Filter.resolve_preset("age:1h", @now)
+
+      assert cutoff == DateTime.add(@now, -1, :hour)
+      assert cutoff == ~U[2026-09-02 11:00:00Z]
+    end
+
+    test "an hour-valued age preset satisfies the prune bound requirement" do
+      # `Prune` refuses a delete bounded at neither end. An age cutoff always
+      # sets the upper bound, so a scheduled run using one is bounded by
+      # construction and needs no separate guard.
+      assert {:ok, filter} = Filter.parse(%{"preset" => "age:6h"})
+
+      refute filter.to == nil
+      assert filter.from == nil
     end
   end
 
@@ -467,5 +505,12 @@ defmodule LoggerDashboard.Logs.FilterTest do
       # with nothing selected, which reads as "no page size" rather than "25".
       assert Filter.limit_options(25) == ["100", "500", "3000", "25"]
     end
+  end
+
+  # Ranking the two families against each other needs a common scale: `:minute`
+  # is shorter than `:hour`, which is shorter than `:day`, so comparing raw
+  # amounts across units would order "90 days" as shorter than "6 hours".
+  defp unit_index(unit) when unit in [:minute, :hour, :day, :week, :month] do
+    Enum.find_index([:minute, :hour, :day, :week, :month], &(&1 == unit))
   end
 end

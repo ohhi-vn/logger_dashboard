@@ -4,11 +4,19 @@ defmodule LoggerDashboardWeb.Endpoint do
   # The session will be stored in the cookie and signed,
   # this means its contents can be read but not tampered with.
   # Set :encryption_salt if you would also like to encrypt it.
+  #
+  # `max_age` is stated rather than inherited: a session carries a digest of the token
+  # that established it, so it cannot outlive a rotation, and eight hours is simply how
+  # long one is good for. It has to be a decision somebody made, not a library default
+  # nobody looked at.
+  @session_max_age 8 * 60 * 60
+
   @session_options [
     store: :cookie,
     key: "_logger_dashboard_key",
     signing_salt: "AgFsn3Bi",
-    same_site: "Lax"
+    same_site: "Lax",
+    max_age: @session_max_age
   ]
 
   socket "/live", Phoenix.LiveView.Socket,

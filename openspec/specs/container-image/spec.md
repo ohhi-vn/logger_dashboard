@@ -5,7 +5,6 @@
 Reproducible OCI image build for the Phoenix release so operators can run the dashboard with podman or docker without hand-rolling Dockerfiles.
 
 ## Requirements
-
 ### Requirement: Multi-stage container build
 
 The system SHALL provide a `Containerfile` at the repository root that builds a runnable release image with `podman build` and `docker build` without modification.
@@ -27,7 +26,12 @@ The system SHALL provide a `Containerfile` at the repository root that builds a 
 
 ### Requirement: Non-root minimal runtime
 
-The system SHALL run the release as a non-root user, listen on `$PORT` (default `4000`), and start with `PHX_SERVER=true` semantics so the endpoint serves traffic.
+The system SHALL run the release as a non-root user, listen on `$DASHBOARD_PORT` (default `4000`), and start with `PHX_SERVER=true` semantics so the endpoint serves traffic.
+
+The image SHALL provide a writable directory owned by the runtime user for the
+dashboard's operational configuration store, defaulting to a path inside the release
+directory, so the release can persist configuration without running as root and
+without the operator having to pre-create anything.
 
 #### Scenario: Run as non-root
 
@@ -39,9 +43,14 @@ The system SHALL run the release as a non-root user, listen on `$PORT` (default 
 - **WHEN** the container starts with default env plus required secrets
 - **THEN** the endpoint accepts HTTP on `$PORT` and serves `/` (behind the auth gate, see `dashboard-auth`) without crash-looping
 
+#### Scenario: The configuration store directory is writable by the runtime user
+
+- **WHEN** the image starts with no configuration store directory specified
+- **THEN** the release can create and write its default configuration store directory as the non-root user, without the operator pre-creating it
+
 ### Requirement: Runtime configuration via environment
 
-The system SHALL configure the release exclusively via environment variables at runtime with no code change: `PHX_HOST`, `PORT`, `SECRET_KEY_BASE`, `CLICKHOUSE_URL`, `CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD`, `CLICKHOUSE_DATABASE`, and `DASHBOARD_AUTH_TOKEN`. The release SHALL boot and serve without any Postgres database: no `DATABASE_URL`, `POOL_SIZE`, or `ECTO_IPV6` variable is read, and no Postgres repo is configured or started.
+The system SHALL configure the release exclusively via environment variables at runtime with no code change: `PHX_HOST`, `PORT`, `SECRET_KEY_BASE`, `CLICKHOUSE_URL`, `CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD`, `CLICKHOUSE_DATABASE`, `DASHBOARD_AUTH_TOKEN`, and the variable naming the dashboard's configuration store directory. The release SHALL boot and serve without any Postgres database: no `DATABASE_URL`, `POOL_SIZE`, or `ECTO_IPV6` variable is read, and no Postgres repo is configured or started.
 
 #### Scenario: Missing release secrets fail fast
 
@@ -67,6 +76,20 @@ The system SHALL configure the release exclusively via environment variables at 
 
 - **WHEN** `CLICKHOUSE_URL` addresses a ClickHouse that requires authentication
 - **THEN** the credentials are taken from the URL's userinfo, and setting `CLICKHOUSE_USER`/`CLICKHOUSE_PASSWORD` alone does not authenticate the client
+
+#### Scenario: Configuration store directory via env
+
+- **WHEN** the container starts with the configuration store directory variable set to
+  a mounted path
+- **THEN** saved dashboard configuration is written to and read from that path with no
+  rebuild
+
+#### Scenario: An unwritable configuration store directory does not stop the release
+
+- **WHEN** the container starts with the configuration store directory variable set to a
+  path that cannot be created or written
+- **THEN** the release still boots and serves traffic, and background tasks fall back to
+  their configured defaults
 
 ### Requirement: Container build hygiene
 

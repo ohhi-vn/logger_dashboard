@@ -41,12 +41,23 @@ defmodule LoggerDashboard.Logs.LogRead do
   end
 
   @doc """
-  List log rows matching `filter`, newest first.
+  List one page of log rows matching `filter`, newest first, and report whether
+  further rows match.
+
+  Returns `{:ok, rows, has_more}` where `rows` holds at most the page size and
+  `has_more` says whether the active filters match at least one row beyond it.
 
   Applies the shared `Filter.predicates/1` clause with bound parameters. `opts`
   overrides `limit`/`offset` from the filter.
+
+  One row past the page is fetched, and only to answer `has_more`. Deciding
+  "is there a next page" from the page's own length cannot distinguish a last
+  page that happens to be exactly full from one with rows behind it, so a total
+  that is an exact multiple of the page size would report a next page and then
+  show an empty one. That extra row is never returned: `rows` stays the display
+  list, so the page and its export carry exactly the page size.
   """
-  @spec list_logs(Filter.t(), keyword()) :: {:ok, [map()]} | {:error, term()}
+  @spec list_logs(Filter.t(), keyword()) :: {:ok, [map()], boolean()} | {:error, term()}
   def list_logs(%Filter{} = filter, opts \\ []) do
     limit = Keyword.get(opts, :limit, filter.limit)
     offset = Keyword.get(opts, :offset, filter.offset)
@@ -60,8 +71,11 @@ defmodule LoggerDashboard.Logs.LogRead do
     LIMIT ? OFFSET ?
     """
 
-    result = ClickhouseExLogger.Repo.query(sql, params ++ [limit, offset])
-    handle_result(result)
+    result = ClickhouseExLogger.Repo.query(sql, params ++ [limit + 1, offset])
+
+    with {:ok, rows} <- handle_result(result) do
+      {:ok, Enum.take(rows, limit), length(rows) > limit}
+    end
   end
 
   @doc false

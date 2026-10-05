@@ -75,6 +75,24 @@ config :clickhouse_ex_logger, ClickhouseExLogger.Repo,
 
 config :logger_dashboard, ash_domains: [LoggerDashboard.Logs]
 
+# The background-task configuration store's directory is set per environment: dev in
+# config/dev.exs, test in config/test.exs, and a release in config/runtime.exs from
+# TASK_CONFIG_DIR.
+
+# Retention policy default: the value in force until something is stored. Disabled
+# by default — a deployment that configures nothing starts with scheduled pruning
+# off, since retention is the one feature here that deletes data with nobody
+# watching.
+#
+# Set `enabled: true` with a `run_at` of "HH:MM UTC" and a `keep` drawn from the
+# `:age` family ("1h", "6h", "12h", "1d", "3d", "7d", "30d", "90d"). A malformed
+# value disables the feature rather than failing boot. The prune page can store a
+# policy for the running system; a stored policy outranks this one and survives a
+# restart, and the page's revert action removes it to come back here.
+#
+#   config :logger_dashboard, retention: [enabled: true, run_at: "03:00 UTC", keep: "7d"]
+config :logger_dashboard, retention: [enabled: false]
+
 config :ash, default_string_length_count: :codepoints
 
 # Import environment specific config. This must remain at the bottom

@@ -34,16 +34,52 @@ Leave it unset and the app generates an ephemeral token at boot, keeps it in mem
 token: p0IT5ILGogM9yep1hjaehE66uwwMUrfG
 ```
 
-It changes on every restart. In a container, read it back with `podman logs`.
+In a container, read it back with `podman logs`.
 
-Either credential form works:
+### Signing in
+
+A browser that opens a gated page without a session is redirected to `/login`, which
+asks for the token. A correct token signs you in and returns you to the page you were
+heading for; **Sign out** in the header ends the session and sends you back to `/login`.
+Static assets stay public; they carry no data.
+
+The session is a cookie, and it records a **digest** of the token rather than the token
+itself — the cookie is signed, not encrypted, so anyone holding it can read it.
+
+### Accessing it from a script
+
+There is no `Authorization` header path: neither HTTP Basic nor `Bearer` authenticates
+anything. Sign in once and reuse the cookie jar:
 
 ```bash
-curl -u "operator:$DASHBOARD_AUTH_TOKEN" http://localhost:4000/logs      # Basic (password = token)
-curl -H "Authorization: Bearer $DASHBOARD_AUTH_TOKEN" http://localhost:4000/logs
+# 1. Sign in. The CSRF token is in the form, so scrape it out.
+BASE=http://localhost:4000
+CSRF=$(curl -s -c jar.txt "$BASE/login" \
+  | grep -o '<input name="_csrf_token"[^>]*>' \
+  | sed -n 's/.*value="\([^"]*\)".*/\1/p')
+
+# 2. Exchange the token for the session cookie.
+curl -s -b jar.txt -c jar.txt -X POST "$BASE/login" \
+  --data-urlencode "_csrf_token=$CSRF" \
+  --data-urlencode "session[token]=$DASHBOARD_AUTH_TOKEN" \
+  -o /dev/null -w '%{http_code}\n'      # 302
+
+# 3. Now the jar is authenticated.
+curl -s -b jar.txt "$BASE/logs"
 ```
 
-A browser gets a `401` with a `WWW-Authenticate: Basic` challenge, so it prompts for a username and password — the password is the token and the username is ignored. Static assets stay public; they carry no data.
+A request that does not accept HTML — `curl` with an explicit `Accept: application/json`,
+say — gets a bare `401` rather than the login page, so a script can tell "wrong" from
+"here is a form for a browser".
+
+### Sessions and restarts
+
+A session cannot outlive the token that established it: the digest is re-checked on
+every request and on every LiveView mount, so **replacing the token signs every open
+session out**. With the default ephemeral token that means a restart does it, because
+the token is regenerated. Set a pinned `DASHBOARD_AUTH_TOKEN` — as the compose stack
+already requires — if you want sessions to survive a deploy. Sessions otherwise expire
+after eight hours.
 
 Tokens are compared in constant time and are never logged except for that one boot line.
 
@@ -84,8 +120,10 @@ podman compose down           # stop; log rows are kept
 podman compose down --volumes # stop and DELETE all stored logs
 ```
 
-`down --volumes` destroys the ClickHouse data volume. The next `up` recreates the
-schema automatically, so the dashboard comes back empty but working.
+`down --volumes` destroys the ClickHouse data volume and the saved-configuration
+volume. The next `up` recreates the schema automatically, so the dashboard comes back
+empty but working, and any policy you saved on the prune page is gone with the
+configured defaults back in force.
 
 Notes and caveats:
 
@@ -98,9 +136,52 @@ Notes and caveats:
   to HTTPS. Terminate TLS in front of the published port for remote access —
   the stack itself serves no TLS.
 - **Single node, no replication.** All logs live in one local volume.
+- **Run one dashboard instance.** Saved configuration is a file in that
+  container's own volume, so a second instance keeps its own policy and runs its
+  own schedule — and both prune the same ClickHouse. See
+  [Scheduled retention](#scheduled-retention).
 - **Pointing at an existing ClickHouse instead** works too: drop the `clickhouse`
   service from `compose.yaml` and set `CLICKHOUSE_URL` on the dashboard to your
   instance.
+
+## Scheduled retention
+
+`/prune` can arm a policy that deletes logs older than a retained age, across every
+node, once a day with nobody watching. Every run is logged with the scope and cutoff it
+applied.
+
+**Saving an enabled policy does not arm it.** "Save policy" asks for confirmation
+first, naming the scope and retained age it would reach; only "Confirm and arm"
+writes the policy and starts the schedule. Until then the policy exists nowhere — not
+saved, not in force, and not pending — and cancelling discards it with the policy in
+force left untouched. Turning the policy *off*, or removing the saved one, needs no
+confirmation: neither can delete anything.
+
+The policy in force can come from two places:
+
+- the environment (`RETENTION_ENABLED`, `RETENTION_RUN_AT`, `RETENTION_KEEP`), which
+  is what applies until you save one from the page;
+- a policy you confirmed on `/prune`, which outranks the environment and **survives a
+  restart and a redeploy**.
+
+The page states which of the two is in force. "Remove saved policy" deletes the saved
+one, so the environment's policy is in force again for this run and every later one.
+The dashboard never rewrites the environment it was deployed with.
+
+Saved policies live in `TASK_CONFIG_DIR` (`/var/lib/logger_dashboard` in the compose
+stack, on the `task-config-data` volume). That volume is what makes a saved policy
+outlive a redeploy; without it the directory sits in the container's writable layer and
+is lost when the container is recreated. If the directory cannot be written the
+dashboard still serves, background tasks fall back to the configured policy, and the
+prune page says so rather than reporting a save that did not happen.
+
+Two things to know before arming it:
+
+- **The schedule is not made retroactive.** A dashboard that was down when the run
+  time passed does not prune on the next boot; it waits for the next occurrence. A
+  saved policy is durable, and catch-up is still refused.
+- **One instance.** A second dashboard keeps its own saved policy and fires its own
+  deletes at the same ClickHouse. There is no leader election, by design.
 
 ## Container image
 
@@ -122,6 +203,17 @@ The image runs as `nobody`, listens on `$PORT` (default `4000`), and needs no
 Elixir or Node at runtime. `SECRET_KEY_BASE` is the only variable required in
 prod — the boot fails naming it when missing. There is no other database: the
 dashboard reads only ClickHouse.
+
+Configuration you save through the UI goes to `/app/task_config` unless
+`TASK_CONFIG_DIR` says otherwise. That path is inside the container, so pass a
+volume if it has to outlive the container:
+
+```bash
+podman run -d --name logger_dashboard -p 4000:4000 \
+  -v logger-dashboard-config:/var/lib/logger_dashboard \
+  -e TASK_CONFIG_DIR=/var/lib/logger_dashboard \
+  ... logger-dashboard:latest
+```
 
 Apply the ClickHouse DDL before the first start (the image has no Mix):
 
@@ -171,6 +263,10 @@ requires `--allow-prod`.
 | `CLICKHOUSE_USER` | `default` | See the note below — not forwarded to the client. |
 | `CLICKHOUSE_PASSWORD` | empty | See the note below — not forwarded to the client. |
 | `CLICKHOUSE_DATABASE` | `logger_dashboard_dev` | |
+| `TASK_CONFIG_DIR` | `<release dir>/task_config` | Where configuration you save from the UI is kept. Put it on persistent storage. |
+| `RETENTION_ENABLED` | `false` | `true`/`1`/`yes`/`on` arms [scheduled retention](#scheduled-retention) from the environment. |
+| `RETENTION_RUN_AT` | `03:00 UTC` | `HH:MM UTC`. |
+| `RETENTION_KEEP` | `7d` | Retained age: `1h`, `6h`, `12h`, `1d`, `3d`, `7d`, `30d`, `90d`. An unrecognised value disables retention rather than failing the boot. |
 
 For a ClickHouse that requires authentication, put the credentials in the
 URL's userinfo:
@@ -215,7 +311,7 @@ Then start with `PHX_SERVER=true bin/logger_dashboard start`.
 
 - **Prune is async and irreversible.** ClickHouse applies `ALTER TABLE ... DELETE` as a background mutation; rows disappear after it completes. There is no rollback.
 - **The token is shared, not per-user.** Anyone holding it can prune. Rotate by changing the env var (or restarting with no token).
-- **Serve over TLS.** Basic/Bearer credentials are only base64-encoded. Terminate TLS in front of the container; the plain-HTTP dev setup is not safe on a network.
+- **Serve over TLS.** The session cookie is a bearer credential: anyone who copies it is authenticated for the rest of its life. Terminate TLS in front of the container; the plain-HTTP dev setup is not safe on a network. `SameSite=Lax` blocks the obvious cross-site POST, but it is not a substitute for TLS.
 - **Message search is in-memory.** `*`/`?` wildcards filter in Elixir over the latest 1,000 ClickHouse-prefiltered rows (node/level/time push down). Tighten the time range for large log volumes.
 - **The ClickHouse password shows up in container metadata.** It travels in the dashboard's URL, so `podman inspect` and `podman compose config` print it. Keep `.env` at `chmod 600`.
 

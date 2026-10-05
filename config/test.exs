@@ -16,6 +16,11 @@ config :swoosh, :api_client, false
 # Print only warnings and errors during test
 config :logger, level: :warning
 
+# The unattended retention run records its scope and cutoff at :info, which is
+# below the level above, so `ExUnit.CaptureLog` would never see it. The audit
+# trail is the point of that log line, so it is captured under test.
+config :logger, level: :info
+
 config :clickhouse_ex_logger, ClickhouseExLogger.Repo,
   url: System.get_env("CLICKHOUSE_URL", "http://localhost:8123"),
   username: System.get_env("CLICKHOUSE_USER", "default"),
@@ -36,3 +41,10 @@ config :phoenix,
 # Shared-token gate default for tests. ConnCase authenticates with this
 # value; unauthenticated paths build a fresh conn without the header.
 config :logger_dashboard, :dashboard_auth_token, "test-token"
+
+# Background-task configuration store for tests. Distinct from dev so a running
+# `mix phx.server` and the suite never read each other's stored configuration.
+# Tests that store anything are responsible for removing it again; a leftover
+# enabled retention policy would otherwise be armed by `Scheduler.init/1` on the
+# next `mix test` run and dispatch a real delete.
+config :logger_dashboard, task_config_dir: Path.expand("../tmp/test/task_config", __DIR__)

@@ -1,13 +1,25 @@
 defmodule LoggerDashboardWeb.PruneLiveTest do
   use LoggerDashboardWeb.ConnCase, async: false
 
+  import ExUnit.CaptureLog
   import Phoenix.LiveViewTest
+
+  alias LoggerDashboard.BackgroundTaskConfig
+  alias LoggerDashboard.BackgroundTaskConfig, as: Store
+  alias LoggerDashboard.Logs.Filter
+  alias LoggerDashboard.Retention.Policy
+  alias LoggerDashboard.Retention.Scheduler
 
   describe "index age shortcuts" do
     test "offers the age shortcuts and not the lookback windows", %{conn: conn} do
       {:ok, lv, _html} = live(conn, ~p"/prune")
 
-      for preset <- ~w(age:1d age:3d age:7d age:30d age:90d) do
+      # Driven from the same owner the template renders, so this asserts the
+      # widened vocabulary without restating it: adding an age cutoff in
+      # `Filter` makes it appear here without a template change.
+      for {preset_id, _duration} <- Filter.presets(:age) do
+        preset = Filter.preset_id(:age, preset_id)
+
         assert has_element?(lv, ~s(#prune-shortcuts [data-preset="#{preset}"]))
       end
 
@@ -17,6 +29,53 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
 
       # Pruning has no "all time": an unbounded delete is never a shortcut.
       refute has_element?(lv, "#prune-shortcuts-all-time")
+    end
+
+    test "offers hour-valued age cutoffs, shortest first", %{conn: conn} do
+      # Sub-day cutoffs are what makes "clear the last hour's rows" expressible
+      # by hand, and they are the units the retention policy is specified in.
+      {:ok, lv, _html} = live(conn, ~p"/prune")
+
+      for preset <- ~w(age:1h age:6h age:12h) do
+        assert has_element?(lv, ~s(#prune-shortcuts [data-preset="#{preset}"]))
+      end
+
+      # An hour-valued cutoff sets only `to`, exactly as a day-valued one does.
+      lv |> element(~s(#prune-shortcuts [data-preset='age:1h'])) |> render_click()
+
+      # The cutoff lands in `to` and the lower bound stays empty, so the preview
+      # is a one-sided delete rather than an unbounded one.
+      to_value =
+        lv
+        |> element(~s(#prune-form input[name="prune[to]"]))
+        |> render()
+
+      from_value =
+        lv
+        |> element(~s(#prune-form input[name="prune[from]"]))
+        |> render()
+
+      # An unset bound renders with no `value` attribute at all rather than an empty
+      # one, so the assertion distinguishes "left open" from "holds a cutoff".
+      refute from_value =~ "value="
+      assert to_value =~ "value="
+    end
+
+    test "an hour-valued shortcut resolves a sub-day cutoff", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/prune")
+
+      lv |> element(~s(#prune-shortcuts [data-preset='age:6h'])) |> render_click()
+
+      lv
+      |> element("#prune-form")
+      |> render_submit(%{
+        "prune" => %{"scope" => "all", "from" => "", "to" => ""}
+      })
+
+      # The form carries the resolved `to`; the confirmation then states the
+      # cutoff it would delete against, and `from` stays unset.
+      html = render(lv)
+      assert html =~ "older than"
     end
 
     test "a shortcut sets only the upper bound and leaves the node scope alone", %{conn: conn} do
@@ -343,6 +402,457 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
       # DELETE is only available via LiveView events, never a GET route.
       assert true
     end
+  end
+
+  describe "index scheduled retention" do
+    setup do
+      # Each test starts from the configured default with nothing saved, so one test's
+      # policy cannot be the next test's starting state. The scheduler read its policy
+      # when it started, so clearing the store is not enough on its own — it is told to
+      # look again, which is the same thing a recovered store needs.
+      Application.delete_env(:logger_dashboard, :retention)
+      Store.delete(Policy, :policy)
+      Scheduler.reload()
+
+      on_exit(fn ->
+        Application.delete_env(:logger_dashboard, :retention)
+        Store.delete(Policy, :policy)
+        Scheduler.reload()
+      end)
+
+      :ok
+    end
+
+    # Save an enabled policy the way an operator does: submit, then confirm. The two
+    # steps are separate on purpose — the submit writes nothing.
+    defp save_enabled(lv, retention) do
+      lv
+      |> form("#retention-form", retention: retention)
+      |> render_submit()
+
+      lv |> element("#retention-confirm-button") |> render_click()
+    end
+
+    # The configured default, in force from the next line on: the scheduler resolves
+    # it when it loads rather than per request, so changing it behind the scheduler's
+    # back would leave the page showing the old one.
+    defp configure(retention) do
+      Application.put_env(:logger_dashboard, :retention, retention)
+      Scheduler.reload()
+    end
+
+    test "shows the configured policy as the one in force", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/prune")
+
+      assert has_element?(lv, "#prune-retention")
+      assert has_element?(lv, "#retention-effective")
+      assert has_element?(lv, "#retention-form")
+
+      # Unconfigured, so the policy is disabled and named as coming from config.
+      assert lv |> element("#retention-effective") |> render() =~ "disabled"
+      assert lv |> element("#retention-source") |> render() =~ "configured policy"
+    end
+
+    test "a saved policy is shown as one that survives a restart", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/prune")
+
+      save_enabled(lv, %{enabled: "true", run_at: "04:00 UTC", keep: "12h"})
+
+      # The source is stated rather than implied: a saved policy and a configured one
+      # are indistinguishable until the operator needs to know which will still be
+      # there after a redeploy.
+      source = lv |> element("#retention-source") |> render()
+
+      assert source =~ "survives a restart"
+
+      effective = lv |> element("#retention-effective") |> render()
+
+      assert effective =~ "12h"
+      assert effective =~ "04:00"
+    end
+
+    test "the two sources render differently", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/prune")
+      configured_source = lv |> element("#retention-source") |> render()
+
+      save_enabled(lv, %{enabled: "true", run_at: "04:00 UTC", keep: "12h"})
+
+      refute configured_source == lv |> element("#retention-source") |> render()
+    end
+
+    test "saving an edit changes the effective policy", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/prune")
+
+      save_enabled(lv, %{enabled: "true", run_at: "05:00 UTC", keep: "30d"})
+
+      assert lv |> element("#retention-effective") |> render() =~ "30d"
+
+      assert {:ok, report} = Scheduler.effective_policy()
+      assert report.policy == %Policy{enabled: true, run_at: {"05:00", "UTC"}, keep: "30d"}
+      assert report.source == :stored
+    end
+
+    test "saving an edit writes into the store and not into the configuration", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/prune")
+
+      save_enabled(lv, %{enabled: "true", run_at: "05:00 UTC", keep: "30d"})
+
+      # Durable, so a redeploy cannot silently un-arm a policy: the value is on disk.
+      assert {:ok, %{"keep" => "30d"}} = Store.get(Policy, :policy)
+
+      # And still not the deployment's own configuration. The dashboard writes its
+      # operational configuration and never rewrites the environment it was given.
+      assert Application.get_env(:logger_dashboard, :retention) == nil
+    end
+
+    test "removing the saved policy returns to the configured one", %{conn: conn} do
+      configure(%{
+        "enabled" => "true",
+        "run_at" => "06:00 UTC",
+        "keep" => "90d"
+      })
+
+      {:ok, lv, _html} = live(conn, ~p"/prune")
+
+      save_enabled(lv, %{enabled: "true", run_at: "05:00 UTC", keep: "1h"})
+
+      assert lv |> element("#retention-effective") |> render() =~ "1h"
+
+      lv |> element("#retention-reset") |> render_click()
+
+      assert lv |> element("#retention-effective") |> render() =~ "90d"
+
+      # Removed, not ignored: a dashboard started now would find nothing saved, which
+      # is what makes reverting hold across the restart that used to undo it.
+      assert {:ok, nil} = Store.get(Policy, :policy)
+      assert {:ok, %{source: :configured}} = Scheduler.effective_policy()
+    end
+
+    test "a saved policy that cannot be used is reported and left in place", %{conn: conn} do
+      configure(%{"enabled" => "true", "keep" => "30d"})
+
+      # A retained age from a release whose `:age` family differed. It must not reach
+      # a delete, and it must survive being reported so it can be inspected.
+      :ok = Store.put(Policy, :policy, %{"enabled" => "true", "keep" => "99y"})
+
+      capture_log(fn ->
+        assert {:ok, %{stored_error: _}} = Scheduler.reload()
+      end)
+
+      {:ok, lv, _html} = live(conn, ~p"/prune")
+
+      # The page says the configured policy is running *and* that something saved is
+      # not in effect — otherwise the operator sees a policy they did not choose and
+      # no explanation.
+      assert lv |> element("#retention-effective") |> render() =~ "30d"
+      refute has_element?(lv, "#retention-store-error")
+
+      warning = lv |> element("#retention-stored-error") |> render()
+
+      assert warning =~ "not in effect"
+      assert warning =~ "99y"
+
+      assert {:ok, %{"keep" => "99y"}} = Store.get(Policy, :policy)
+    end
+
+    test "an unwritable store is reported rather than claimed as saved", %{conn: conn} do
+      configure(%{"enabled" => "true", "keep" => "30d"})
+
+      swap_in_broken_store()
+
+      {:ok, lv, _html} = live(conn, ~p"/prune")
+
+      # The page must never imply a policy is saved while the store is down: the whole
+      # value of the store is that a saved policy survives, and a page reporting
+      # otherwise would be worse than one that could not save at all.
+      assert lv |> element("#retention-source") |> render() =~ "configured policy"
+      refute has_element?(lv, "#retention-stored-error")
+
+      failure = lv |> element("#retention-store-error") |> render()
+
+      assert failure =~ "could not be read"
+      assert failure =~ "Nothing can be saved"
+
+      # And an attempt to save says so, rather than appearing to succeed.
+      capture_log(fn ->
+        save_enabled(lv, %{enabled: "true", run_at: "04:00 UTC", keep: "7d"})
+      end)
+
+      error = lv |> element("#retention-error") |> render()
+
+      assert error =~ "was not armed"
+      assert error =~ "configuration store"
+
+      # Nothing was written, so the decision is still pending rather than silently
+      # resolved: the confirmation stays open for a retry.
+      assert has_element?(lv, "#retention-confirm")
+    end
+
+    test "saving an enabled policy asks for confirmation and states the resolved scope", %{
+      conn: conn
+    } do
+      {:ok, lv, _html} = live(conn, ~p"/prune")
+
+      lv
+      |> form("#retention-form", retention: %{enabled: "true", run_at: "04:00 UTC", keep: "7d"})
+      |> render_submit()
+
+      # Saving does not save. It opens the confirmation, which is where the write and
+      # the arming happen, so the operator is agreeing to a stated policy rather than
+      # to whatever the form happened to hold.
+      assert has_element?(lv, "#retention-confirm")
+
+      scope = lv |> element("#retention-confirm-scope") |> render()
+
+      assert scope =~ "7d"
+      assert scope =~ "every node"
+      assert scope =~ "04:00 UTC"
+
+      # And the panel says plainly that nothing has been written yet.
+      assert lv |> element("#retention-confirm-warning") |> render() =~
+               "Nothing has been saved yet"
+    end
+
+    test "nothing is written or scheduled before the confirmation", %{conn: conn} do
+      configure(%{"enabled" => "false", "keep" => "90d"})
+
+      {:ok, lv, _html} = live(conn, ~p"/prune")
+
+      lv
+      |> form("#retention-form", retention: %{enabled: "true", run_at: "04:00 UTC", keep: "7d"})
+      |> render_submit()
+
+      # The whole point of the gate: an enabled policy that was only *saved* must not
+      # exist anywhere. Not on disk, not in force, and no timer waiting to fire.
+      assert {:ok, nil} = Store.get(Policy, :policy)
+
+      assert {:ok, %{policy: %Policy{keep: "90d"}, source: :configured}} =
+               Scheduler.effective_policy()
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert has_element?(lv, "#retention-confirm")
+        end)
+
+      refute log =~ "[retention] unattended prune"
+    end
+
+    test "a timer is not armed before the confirmation", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/prune")
+
+      lv
+      |> form("#retention-form", retention: %{enabled: "true", run_at: "04:00 UTC", keep: "7d"})
+      |> render_submit()
+
+      # A disabled configured policy means the scheduler holds no timer at all, and
+      # opening a confirmation must not have given it one.
+      assert %{timer: nil} = :sys.get_state(Scheduler)
+    end
+
+    test "confirming arms the policy and reports it", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/prune")
+
+      lv
+      |> form("#retention-form", retention: %{enabled: "true", run_at: "04:00 UTC", keep: "7d"})
+      |> render_submit()
+
+      lv |> element("#retention-confirm-button") |> render_click()
+
+      refute has_element?(lv, "#retention-confirm")
+      assert has_element?(lv, "#retention-result")
+
+      assert {:ok, %{policy: %Policy{enabled: true, keep: "7d"}, source: :stored}} =
+               Scheduler.effective_policy()
+
+      assert {:ok, %{"keep" => "7d"}} = Store.get(Policy, :policy)
+      assert %{timer: timer} = :sys.get_state(Scheduler)
+      assert is_reference(timer)
+    end
+
+    test "confirming arms without deleting anything yet", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/prune")
+
+      lv
+      |> form("#retention-form", retention: %{enabled: "true", run_at: "04:00 UTC", keep: "7d"})
+      |> render_submit()
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          lv |> element("#retention-confirm-button") |> render_click()
+        end)
+
+      # Arming authorises the schedule. The first delete happens at the run time,
+      # not at the moment of arming, so nothing is dispatched here.
+      refute log =~ "[retention] unattended prune"
+    end
+
+    test "cancelling leaves the previous policy in force and writes nothing", %{conn: conn} do
+      configure(%{
+        "enabled" => "false",
+        "run_at" => "03:00 UTC",
+        "keep" => "7d"
+      })
+
+      {:ok, lv, _html} = live(conn, ~p"/prune")
+
+      lv
+      |> form("#retention-form", retention: %{enabled: "true", run_at: "04:00 UTC", keep: "1h"})
+      |> render_submit()
+
+      assert has_element?(lv, "#retention-confirm")
+
+      lv |> element("#retention-cancel-button") |> render_click()
+
+      refute has_element?(lv, "#retention-confirm")
+
+      # Cancelling discards the proposal. There was never a saved edit to keep, which
+      # is what makes cancelling safe now that a saved policy survives a restart.
+      assert {:ok, nil} = Store.get(Policy, :policy)
+
+      assert {:ok, %{policy: %Policy{keep: "7d"}, source: :configured}} =
+               Scheduler.effective_policy()
+
+      assert lv |> element("#retention-result") |> render() =~ "Nothing was changed"
+    end
+
+    test "a disabled policy saves without a confirmation step", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/prune")
+
+      lv
+      |> form("#retention-form", retention: %{enabled: "true", run_at: "04:00 UTC", keep: "1h"})
+      |> render_submit()
+
+      lv |> element("#retention-confirm-button") |> render_click()
+
+      assert {:ok, %{policy: %Policy{enabled: true, keep: "1h"}, source: :stored}} =
+               Scheduler.effective_policy()
+
+      # Turning it off is the safe direction: it deletes nothing and arms nothing, so
+      # making an operator confirm a stop would only add friction where there is no
+      # risk — and stopping a policy you regret is the urgent case.
+      lv
+      |> form("#retention-form", retention: %{enabled: "false", run_at: "04:00 UTC", keep: "1h"})
+      |> render_submit()
+
+      refute has_element?(lv, "#retention-confirm")
+      assert {:ok, %{"enabled" => "false"}} = Store.get(Policy, :policy)
+
+      assert {:ok, %{policy: %Policy{enabled: false}, source: :stored}} =
+               Scheduler.effective_policy()
+
+      assert %{timer: nil} = :sys.get_state(Scheduler)
+    end
+
+    test "an armed policy can be stopped from the page", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/prune")
+
+      lv
+      |> form("#retention-form", retention: %{enabled: "true", run_at: "04:00 UTC", keep: "1h"})
+      |> render_submit()
+
+      lv |> element("#retention-confirm-button") |> render_click()
+
+      # Removing the saved policy outright also works, and needs no confirmation:
+      # nothing about a removal can delete anything either.
+      lv |> element("#retention-reset") |> render_click()
+
+      assert {:ok, %{policy: %Policy{enabled: false}, source: :configured}} =
+               Scheduler.effective_policy()
+    end
+
+    test "an invalid run time is rejected and names the remedy", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/prune")
+
+      lv
+      |> form("#retention-form", retention: %{enabled: "true", run_at: "99:99", keep: "7d"})
+      |> render_submit()
+
+      assert has_element?(lv, "#retention-error")
+
+      error = lv |> element("#retention-error") |> render()
+
+      assert error =~ "invalid run time"
+      assert error =~ "HH:MM"
+    end
+
+    test "an invalid retained age is rejected and offers the valid ones", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/prune")
+
+      # Pushed directly rather than through `form/3`: the control is a select, and
+      # `render_submit/2` rejects a value its options do not offer. An out-of-range
+      # `keep` still has to be refused rather than crash, which is what a stale
+      # rendered page or a hand-crafted request would produce.
+      render_submit(lv, "retention_apply", %{
+        "retention" => %{"enabled" => "true", "run_at" => "04:00 UTC", "keep" => "7 days"}
+      })
+
+      error = lv |> element("#retention-error") |> render()
+
+      # The message names the offered ids. They are HTML-escaped in the rendered
+      # element, so the quotes are compared escaped.
+      assert error =~ "invalid retained age"
+      assert error =~ "&quot;7d&quot;"
+      assert error =~ "&quot;1h&quot;"
+    end
+
+    test "confirming without a pending confirmation arms nothing", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/prune")
+
+      # The confirm event is reachable on its own, so it has to refuse rather than
+      # arm whatever the form currently holds. The button is absent from the DOM
+      # until a confirmation is pending, so the event is pushed directly.
+      render_click(lv, "retention_confirm", %{})
+
+      assert {:ok, %{policy: %Policy{enabled: false}, source: :configured}} =
+               Scheduler.effective_policy()
+
+      assert has_element?(lv, "#retention-error")
+    end
+
+    test "an already-armed policy needs no further confirmation to keep running" do
+      # The gate is on arming, not on each run: re-prompting nightly would train
+      # operators to click through it, and the per-run log is what records what
+      # actually happened.
+      name = :"armed_#{System.unique_integer([:positive, :monotonic])}"
+      start_supervised!(%{id: name, start: {Scheduler, :start_link, [[name: name]]}})
+
+      policy = %Policy{enabled: true, run_at: {"04:00", "UTC"}, keep: "7d"}
+
+      Scheduler.set_override(policy, name)
+
+      # The armed policy holds a timer rather than waiting for a prompt, and a
+      # subsequent call needs no confirmation step.
+      assert %{timer: timer} = :sys.get_state(name)
+      assert is_reference(timer)
+
+      assert {:ok, %{policy: ^policy, source: :stored}} = Scheduler.effective_policy(name)
+    end
+  end
+
+  # The page reads the scheduler registered under its own name, so the only way to
+  # show it a store that cannot be opened is to give that name a scheduler bound to
+  # one. The application's own child is replaced and then put back.
+  defp swap_in_broken_store do
+    # Both processes are linked to the test, so they are gone by the time `on_exit`
+    # runs; putting the application's child back is all that is left to do.
+    :ok = Supervisor.terminate_child(LoggerDashboard.Supervisor, Scheduler)
+
+    on_exit(fn ->
+      Supervisor.restart_child(LoggerDashboard.Supervisor, Scheduler)
+    end)
+
+    dir = Path.join(System.tmp_dir!(), "prune_live_test_#{System.unique_integer([:positive])}")
+    File.mkdir_p!(Path.join(dir, "0.cub"))
+    on_exit(fn -> File.rm_rf!(dir) end)
+
+    capture_log(fn ->
+      store = :"prune_live_store_#{System.unique_integer([:positive])}"
+
+      {:ok, _store} = BackgroundTaskConfig.start_link(name: store, data_dir: dir)
+      {:ok, _scheduler} = Scheduler.start_link(store: store)
+    end)
+
+    :ok
   end
 
   defp prune_attrs(node) do

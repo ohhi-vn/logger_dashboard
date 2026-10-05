@@ -35,6 +35,27 @@ context: |
     returns `%ClickHouse.Result{rows: nil}` **without raising**, so treat a
     `nil` rows field as an error, never as an empty result set.
 
+  ## Raw reads depend on a decodable response format
+
+  Only `JSONCompactEachRow`, `RowBinary`, and `Values` are actually compiled
+  into the driver. `ClickHouse.Format.TSV` and its siblings sit behind
+  `if Code.ensure_loaded?(NimbleCSV)`, and `nimble_csv` is declared
+  `optional: true` by the `clickhouse` library, so it is never fetched —
+  `_build/*/lib/clickhouse/ebin/` contains no TSV module.
+
+  Raw reads work because `AshClickhouse.Connection` pins
+  `default_format = "JSONCompactEachRow"` on every query it issues, which is
+  one of the three that do decode. That pin is the invariant, and it lives in
+  the data layer rather than in this project's config — do not "fix" the
+  missing TSV decoders by adding `nimble_csv`; that would install three
+  decoders this project never uses and change no behavior.
+
+  The consequence is what makes `LogRead.handle_result/1` load-bearing rather
+  than defensive dead code: it converts a format the driver cannot decode into
+  a visible failure instead of a log viewer that renders as though the node
+  produced no logs. Keep that branch, and keep its test, if the branch ever
+  looks unreachable.
+
   Always bind every value as a parameter. No user input reaches a SQL string.
 
   ## Testing

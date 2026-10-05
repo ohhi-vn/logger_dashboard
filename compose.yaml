@@ -77,17 +77,27 @@ services:
       # characters.
       CLICKHOUSE_URL: http://default:${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD in .env}@clickhouse:8123
       CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-logger_dashboard}
+      # Where the dashboard keeps configuration an operator saves through it —
+      # scheduled retention today. On a named volume so a saved policy survives a
+      # redeploy rather than reverting to the environment's defaults.
+      TASK_CONFIG_DIR: ${TASK_CONFIG_DIR:-/var/lib/logger_dashboard}
+    volumes:
+      - task-config-data:${TASK_CONFIG_DIR:-/var/lib/logger_dashboard}
     ports:
       - "127.0.0.1:${DASHBOARD_PORT:-4000}:4000"
     healthcheck:
       # Duplicates the Containerfile probe so `podman compose ps` reports it
       # even when the image is built in the default OCI format and the
-      # image-level HEALTHCHECK is dropped. 401 is a valid answer: every route
-      # sits behind the shared-token gate.
+      # image-level HEALTHCHECK is dropped.
+      #
+      # 302 is the expected answer: every route sits behind the shared-token gate, and
+      # curl sends `Accept: */*`, so an unauthenticated probe is redirected to the
+      # token page rather than answered. 401 stays accepted for a client that asks for
+      # a non-HTML representation.
       test:
         [
           "CMD-SHELL",
-          "curl -s -o /dev/null -w '%{http_code}' http://localhost:4000/logs | grep -qE '^(200|401)$' || exit 1"
+          "curl -s -o /dev/null -w '%{http_code}' http://localhost:4000/logs | grep -qE '^(200|302|401)$' || exit 1"
         ]
       interval: 30s
       timeout: 10s
@@ -97,3 +107,7 @@ services:
 
 volumes:
   clickhouse-data:
+  # Saved dashboard configuration (scheduled retention). `compose down` keeps it;
+  # `compose down --volumes` removes it and the dashboard returns to its configured
+  # defaults.
+  task-config-data:

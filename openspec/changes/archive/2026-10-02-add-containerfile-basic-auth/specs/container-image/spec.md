@@ -27,7 +27,7 @@ The system SHALL provide a `Containerfile` at the repository root that builds a 
 
 ### Requirement: Non-root minimal runtime
 
-The system SHALL run the release as a non-root user, listen on `$PORT` (default `4000`), and start with `PHX_SERVER=true` semantics so the endpoint serves traffic.
+The system SHALL run the release as a non-root user, listen on `$DASHBOARD_PORT` (default `4000`), and start with `PHX_SERVER=true` semantics so the endpoint serves traffic.
 
 #### Scenario: Run as non-root
 

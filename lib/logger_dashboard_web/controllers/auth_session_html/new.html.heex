@@ -1,0 +1,42 @@
+<div class="flex min-h-screen flex-col items-center justify-center gap-6 bg-base-200 px-4 py-10">
+  <div class="w-full max-w-sm space-y-6">
+    <div class="flex items-center justify-between gap-3">
+      <div class="flex items-center gap-2 text-sm font-semibold tracking-tight">
+        <.icon name="hero-command-line" class="size-5 text-primary" />
+        <span>Log Dashboard</span>
+      </div>
+      <Layouts.theme_toggle />
+    </div>
+
+    <div class="rounded-xl border border-base-300 bg-base-100 p-6 shadow-sm">
+      <h1 class="text-lg font-bold tracking-tight">Enter the token</h1>
+      <p class="mt-1 text-sm text-base-content/70">
+        Anyone with the token has full access, including pruning. There are no user accounts.
+      </p>
+
+      <.form for={@form} id="login-form" action={~p"/login"} method="post" class="mt-5">
+        <.input
+          field={@form[:token]}
+          type="password"
+          label="Token"
+          autocomplete="current-password"
+          placeholder="Paste the dashboard token"
+          required
+        />
+
+        <p :if={@error} id="login-error" class="alert alert-error mt-4">{@error}</p>
+
+        <div class="mt-5">
+          <.button id="login-submit" class="w-full">Sign in</.button>
+        </div>
+      </.form>
+    </div>
+
+    <p class="text-center text-xs text-base-content/70">
+      Set <code class="font-mono">DASHBOARD_AUTH_TOKEN</code>
+      before starting the app, or
+      read the generated one from the startup log. See <code class="font-mono">mix
+      logger_dashboard.gen.token</code>.
+    </p>
+  </div>
+</div>

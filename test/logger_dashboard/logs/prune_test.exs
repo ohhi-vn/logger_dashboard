@@ -78,7 +78,7 @@ defmodule LoggerDashboard.Logs.PruneTest do
                "from" => "2026-09-01T00:00:00Z"
              })
 
-    {sql, params} = Prune.where_clause(filter, :node)
+    {sql, params} = Prune.where_clause(filter)
     assert sql =~ "node IN (?)"
     assert sql =~ "level = ?"
     assert sql =~ "timestamp >="
