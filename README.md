@@ -109,10 +109,12 @@ Required secrets, and how to generate them:
 | `CLICKHOUSE_PASSWORD` | `openssl rand -hex 24` |
 
 `podman compose up` aborts naming any missing variable before it creates a
-container, so a stack never starts with a default or empty secret. Keep the
-password free of `/ : @ ? # & %` and whitespace — it travels in the dashboard's
-ClickHouse URL (see [Configuration](#configuration)), and hex output has none of
-those characters.
+container, so a stack never starts with a default or empty secret. To connect
+as a non-`default` user, set `CLICKHOUSE_USER` to the provisioned name; the
+dashboard and the ClickHouse healthcheck both use it (default `default`).
+The password travels in the dashboard's effective ClickHouse URL
+(see [Configuration](#configuration)); hex output avoids reserved URL
+characters entirely, and other values are percent-encoded at boot.
 
 Common commands:
 
@@ -263,32 +265,39 @@ requires `--allow-prod`.
 | `DASHBOARD_PORT` | `4000` (`5051` in the compose stack) | HTTP port: same value sets the container listen port and the published host port in compose. |
 | `PHX_HOST` | `example.com` | Public host used for generated URLs. |
 | `SECRET_KEY_BASE` | — | **Required in prod.** Raises at boot when unset. |
-| `CLICKHOUSE_URL` | `http://localhost:8123` | Service URL; the compose stack uses `http://default:<password>@clickhouse:8124`. |
-| `CLICKHOUSE_USER` | `default` | See the note below — not forwarded to the client. |
-| `CLICKHOUSE_PASSWORD` | empty | See the note below — not forwarded to the client. |
+| `CLICKHOUSE_URL` | `http://localhost:8123` | Service URL; the compose stack uses bare `http://clickhouse:8124` and the release injects credentials (next note). A URL that already carries userinfo is used verbatim. |
+| `CLICKHOUSE_USER` | `default` | Honored via the effective URL below. |
+| `CLICKHOUSE_PASSWORD` | empty | Honored via the effective URL below. |
 | `CLICKHOUSE_DATABASE` | `cluster_log` | |
 | `TASK_CONFIG_DIR` | `<release dir>/task_config` | Where configuration you save from the UI is kept. Put it on persistent storage. |
 | `RETENTION_ENABLED` | `false` | `true`/`1`/`yes`/`on` arms [scheduled retention](#scheduled-retention) from the environment. |
 | `RETENTION_RUN_AT` | `03:00 UTC` | `HH:MM UTC`. |
 | `RETENTION_KEEP` | `7d` | Retained age: `1h`, `6h`, `12h`, `1d`, `3d`, `7d`, `30d`, `90d`. An unrecognised value disables retention rather than failing the boot. |
 
-For a ClickHouse that requires authentication, put the credentials in the
-URL's userinfo:
+For a ClickHouse that requires authentication, set the user and password
+alongside a bare URL and the release builds the effective URL at boot:
 
 ```
-CLICKHOUSE_URL=http://default:<password>@clickhouse:8124
+CLICKHOUSE_URL=http://clickhouse:8124
+CLICKHOUSE_USER=my_user
+CLICKHOUSE_PASSWORD=<password>
 ```
 
-`CLICKHOUSE_USER` and `CLICKHOUSE_PASSWORD` are read into the repo config but
-are **not** passed on to the HTTP client, which receives only the URL — so on a
-password-protected server they authenticate nothing. This is why the compose
-stack builds the URL with the credentials in it. Prefer a password without
-`/ : @ ? # & %` so the URL stays well-formed.
+`CLICKHOUSE_USER` and `CLICKHOUSE_PASSWORD` are injected as percent-encoded
+URL userinfo by `config/runtime.exs` (`LoggerDashboard.ClickhouseUrl`),
+because the HTTP client receives only the URL — the separate keys alone
+authenticate nothing. A `CLICKHOUSE_URL` that already carries userinfo
+(e.g. `http://my_user:<password>@my-host:8123` for an external server) wins
+verbatim. Hex passwords avoid reserved URL characters entirely; other values
+are encoded at boot.
 
 ```elixir
-# config/runtime.exs (env overrides)
+# config/runtime.exs (env overrides) — url is the effective URL built from
+# the three values above via LoggerDashboard.ClickhouseUrl
+clickhouse_url = LoggerDashboard.ClickhouseUrl.build(base_url, user, password)
+
 config :clickhouse_ex_logger, ClickhouseExLogger.Repo,
-  url: System.get_env("CLICKHOUSE_URL", "http://localhost:8123"),
+  url: clickhouse_url,
   username: System.get_env("CLICKHOUSE_USER", "default"),
   password: System.get_env("CLICKHOUSE_PASSWORD", ""),
   database: System.get_env("CLICKHOUSE_DATABASE", "cluster_log")

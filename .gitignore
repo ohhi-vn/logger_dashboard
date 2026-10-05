@@ -44,3 +44,4 @@ npm-debug.log
 .expert
 .dexter.db*
 /task_config
+.elixir_ls

@@ -21,10 +21,24 @@ config :logger, level: :warning
 # trail is the point of that log line, so it is captured under test.
 config :logger, level: :info
 
+clickhouse_base_url = System.get_env("CLICKHOUSE_URL", "http://localhost:8123")
+clickhouse_user = System.get_env("CLICKHOUSE_USER", "default")
+clickhouse_password = System.get_env("CLICKHOUSE_PASSWORD", "")
+
+# Only the URL authenticates (see config/runtime.exs). Guarded because this
+# file is evaluated before compilation on a clean checkout; at test runtime
+# `config/runtime.exs` normalizes again after the module is available.
+clickhouse_url =
+  if Code.ensure_loaded?(LoggerDashboard.ClickhouseUrl) do
+    LoggerDashboard.ClickhouseUrl.build(clickhouse_base_url, clickhouse_user, clickhouse_password)
+  else
+    clickhouse_base_url
+  end
+
 config :clickhouse_ex_logger, ClickhouseExLogger.Repo,
-  url: System.get_env("CLICKHOUSE_URL", "http://localhost:8123"),
-  username: System.get_env("CLICKHOUSE_USER", "default"),
-  password: System.get_env("CLICKHOUSE_PASSWORD", ""),
+  url: clickhouse_url,
+  username: clickhouse_user,
+  password: clickhouse_password,
   database: System.get_env("CLICKHOUSE_DATABASE", "logger_dashboard_test")
 
 # Initialize plugs at runtime for faster test compilation

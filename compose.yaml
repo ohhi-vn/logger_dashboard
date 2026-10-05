@@ -18,11 +18,14 @@ services:
     # A mounted config file would also work but breaks when the checkout
     # lives on a path the container VM cannot share.
     command: ["--", "--http_port=8124", "--tcp_port=9001"]
-    # No CLICKHOUSE_USER: the full-privilege `default` user is used with a
-    # password, because schema bootstrap issues DDL.
+    # `CLICKHOUSE_USER` is optional: when set, the server image provisions
+    # that user with `CLICKHOUSE_PASSWORD`; when unset, the `default` user
+    # keeps the password. The dashboard and the healthcheck below use the
+    # same value (defaulting to `default`), so a custom user connects.
     environment:
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD in .env}
       CLICKHOUSE_DB: ${CLICKHOUSE_DATABASE:-cluster_log}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-}
     volumes:
       - clickhouse-data:/var/lib/clickhouse
     ports:
@@ -34,12 +37,13 @@ services:
     healthcheck:
       # The same authenticated connection the dashboard makes, so wrong
       # credentials report unhealthy here instead of surfacing as a failed
-      # schema application. `$$` escapes interpolation so the password comes
-      # from the container's own environment.
+      # schema application. `$$` escapes interpolation so the credentials come
+      # from the container's own environment, defaulting to `default` like
+      # the dashboard does.
       test:
         [
           "CMD-SHELL",
-          "clickhouse-client --host 127.0.0.1 --port 9001 --user default --password \"$$CLICKHOUSE_PASSWORD\" --query 'SELECT 1'"
+          "clickhouse-client --host 127.0.0.1 --port 9001 --user \"$${CLICKHOUSE_USER:-default}\" --password \"$$CLICKHOUSE_PASSWORD\" --query 'SELECT 1'"
         ]
       interval: 10s
       timeout: 5s
@@ -79,13 +83,15 @@ services:
       # Same var drives the release listen port and both sides of the publish
       # below, so host and container stay literally equal for every override.
       DASHBOARD_PORT: ${DASHBOARD_PORT:-5051}
-      # The credentials ride in the URL, not in CLICKHOUSE_USER/CLICKHOUSE_PASSWORD:
-      # AshClickhouse.Connection passes only :url through to the HTTP client, so
-      # separate username/password config never reaches the wire and every
-      # request would be rejected by a password-protected server. hackney turns
-      # URL userinfo into basic auth. See .env.example on safe password
-      # characters.
-      CLICKHOUSE_URL: http://default:${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD in .env}@clickhouse:8124
+      # The dashboard authenticates from the URL's userinfo, which
+      # `config/runtime.exs` builds from these three values (percent-encoding
+      # them, and preserving a `CLICKHOUSE_URL` that already carries userinfo
+      # for external servers). AshClickhouse forwards only `:url` to the HTTP
+      # client, so the separate user/password never reach the wire on their
+      # own — they must meet in the effective URL.
+      CLICKHOUSE_URL: http://clickhouse:8124
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD in .env}
       CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-cluster_log}
       # Where the dashboard keeps configuration an operator saves through it —
       # scheduled retention today. On a named volume so a saved policy survives a

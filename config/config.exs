@@ -80,6 +80,11 @@ config :clickhouse_ex_logger, ClickhouseExLogger.Repo,
   password: "",
   database: "logger_dashboard_dev"
 
+# Note: only the URL authenticates on the wire (see
+# `LoggerDashboard.ClickhouseUrl` and `config/runtime.exs`, which injects
+# `CLICKHOUSE_USER`/`CLICKHOUSE_PASSWORD` as URL userinfo). A `CLICKHOUSE_URL`
+# that already carries userinfo is used verbatim.
+
 config :logger_dashboard, ash_domains: [LoggerDashboard.Logs]
 
 # The background-task configuration store's directory is set per environment: dev in

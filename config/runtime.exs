@@ -21,12 +21,27 @@ if System.get_env("PHX_SERVER") do
 end
 
 config :logger_dashboard, LoggerDashboardWeb.Endpoint,
-  http: [port: String.to_integer(System.get_env("DASHBOARD_PORT", "4000"))]
+  http: [port: String.to_integer(System.get_env("DASHBOARD_PORT", "5051"))]
+
+clickhouse_base_url = System.get_env("CLICKHOUSE_URL", "http://localhost:8123")
+clickhouse_user = System.get_env("CLICKHOUSE_USER", "default")
+clickhouse_password = System.get_env("CLICKHOUSE_PASSWORD", "")
+
+# Only the URL authenticates: AshClickhouse forwards just `:url` to the
+# `clickhouse` HTTP client (basic auth from URL userinfo), so a custom
+# `CLICKHOUSE_USER` must be injected here. A URL that already carries
+# userinfo wins verbatim.
+clickhouse_url =
+  if Code.ensure_loaded?(LoggerDashboard.ClickhouseUrl) do
+    LoggerDashboard.ClickhouseUrl.build(clickhouse_base_url, clickhouse_user, clickhouse_password)
+  else
+    clickhouse_base_url
+  end
 
 config :clickhouse_ex_logger, ClickhouseExLogger.Repo,
-  url: System.get_env("CLICKHOUSE_URL", "http://localhost:8123"),
-  username: System.get_env("CLICKHOUSE_USER", "default"),
-  password: System.get_env("CLICKHOUSE_PASSWORD", ""),
+  url: clickhouse_url,
+  username: clickhouse_user,
+  password: clickhouse_password,
   database: System.get_env("CLICKHOUSE_DATABASE", "cluster_log")
 
 # Dashboard shared-token gate. Predefined via DASHBOARD_AUTH_TOKEN, else a
