@@ -195,6 +195,228 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
     end
   end
 
+  describe "index preview count and sample" do
+    @describetag :clickhouse
+
+    setup %{conn: conn} do
+      node = "prune-preview-#{System.system_time(:millisecond)}-#{:rand.uniform(1_000_000)}@host"
+      now = DateTime.truncate(DateTime.utc_now(), :microsecond)
+
+      rows =
+        for {message, minutes_ago} <- [
+              {"preview ui newest", 1},
+              {"preview ui older", 2}
+            ] do
+          %{
+            id: Ash.UUID.generate(),
+            timestamp: DateTime.add(now, -minutes_ago, :minute),
+            level: "info",
+            message: message,
+            module: "Test",
+            file: nil,
+            line: nil,
+            function: nil,
+            metadata: %{},
+            node: node
+          }
+        end
+
+      assert {:ok, _} = ClickhouseExLogger.Insert.insert(rows)
+      Process.sleep(2_000)
+
+      on_exit(fn -> ClickhouseExLogger.Repo.query("DELETE FROM logs WHERE node = ?", [node]) end)
+
+      {:ok, conn: conn, node: node, now: now}
+    end
+
+    test "states the matching row count and the newest sample", %{
+      conn: conn,
+      node: node,
+      now: now
+    } do
+      {:ok, lv, _html} = live(conn, "/prune?scope=node&node=#{node}")
+
+      lv
+      |> form("#prune-form",
+        prune: %{
+          scope: "node",
+          node: node,
+          level: "all",
+          from: DateTime.to_iso8601(DateTime.add(now, -60, :minute))
+        }
+      )
+      |> render_submit()
+
+      assert has_element?(lv, "#prune-confirm")
+      assert has_element?(lv, "#prune-preview-count", ~r/Rows that will be deleted: 2/)
+      assert has_element?(lv, "#prune-preview-rows")
+      assert has_element?(lv, "#prune-preview-rows", "preview ui newest")
+      assert has_element?(lv, "#prune-preview-rows", "preview ui older")
+    end
+
+    test "an empty scope states zero and offers no sample", %{conn: conn} do
+      node = "no-such-node-#{System.unique_integer([:positive])}@host"
+      {:ok, lv, _html} = live(conn, ~p"/prune?scope=node&node=#{node}")
+
+      lv
+      |> form("#prune-form",
+        prune: %{scope: "node", node: node, level: "all", from: "2000-01-01T00:00:00Z"}
+      )
+      |> render_submit()
+
+      assert has_element?(lv, "#prune-confirm")
+      assert has_element?(lv, "#prune-preview-count", ~r/Rows that will be deleted: 0/)
+      refute has_element?(lv, "#prune-preview-rows")
+    end
+  end
+
+  describe "click selectors" do
+    setup %{conn: conn} do
+      tag = "pruneopt-#{System.system_time(:millisecond)}-#{:rand.uniform(1_000_000)}@host"
+
+      row = %{
+        id: Ash.UUID.generate(),
+        timestamp: DateTime.truncate(DateTime.utc_now(), :microsecond),
+        level: "info",
+        message: "prune options row",
+        module: "Test",
+        file: nil,
+        line: nil,
+        function: nil,
+        metadata: %{},
+        node: tag
+      }
+
+      assert {:ok, 1} = ClickhouseExLogger.Insert.insert([row])
+      Process.sleep(2_000)
+
+      on_exit(fn -> ClickhouseExLogger.Repo.query("DELETE FROM logs WHERE node = ?", [tag]) end)
+
+      {:ok, conn: conn, tag: tag}
+    end
+
+    test "offers known nodes alongside the node input", %{conn: conn, tag: tag} do
+      {:ok, lv, _html} = live(conn, ~p"/prune")
+
+      assert has_element?(lv, "#prune-node-options")
+      assert has_element?(lv, ~s(#prune-node-options [data-node="#{tag}"]))
+      assert has_element?(lv, ~s(#prune-form input[name="prune[node]"]))
+    end
+
+    test "clicking a node option selects the single-node scope", %{conn: conn, tag: tag} do
+      {:ok, lv, _html} = live(conn, ~p"/prune?scope=all")
+
+      lv |> element(~s(#prune-node-options [data-node="#{tag}"])) |> render_click()
+
+      assert has_element?(
+               lv,
+               "#prune-form select[name='prune[scope]'] option[selected][value='node']"
+             )
+
+      assert prune_field(lv, "prune_node") == tag
+
+      assert has_element?(
+               lv,
+               ~s(#prune-node-options [data-node="#{tag}"][aria-pressed="true"])
+             )
+    end
+
+    test "clicking a node option replaces the previous node and keeps range and level", %{
+      conn: conn,
+      tag: tag
+    } do
+      {:ok, lv, _html} =
+        live(
+          conn,
+          "/prune?scope=node&node=other%40h&level=error&from=2026-01-01T00:00:00Z&to=2026-02-01T00:00:00Z"
+        )
+
+      lv |> element(~s(#prune-node-options [data-node="#{tag}"])) |> render_click()
+
+      assert prune_field(lv, "prune_node") == tag
+
+      assert has_element?(
+               lv,
+               "#prune-form select[name='prune[level]'] option[selected][value='error']"
+             )
+
+      assert prune_field(lv, "prune_from") == "2026-01-01T00:00:00Z"
+      assert prune_field(lv, "prune_to") == "2026-02-01T00:00:00Z"
+    end
+
+    test "clicking a node option previews and deletes nothing on its own", %{
+      conn: conn,
+      tag: tag
+    } do
+      {:ok, lv, _html} = live(conn, ~p"/prune")
+
+      lv |> element(~s(#prune-node-options [data-node="#{tag}"])) |> render_click()
+
+      refute has_element?(lv, "#prune-confirm")
+      refute has_element?(lv, "#prune-result")
+    end
+
+    test "clicking a node option clears a stale preview", %{conn: conn, tag: tag} do
+      {:ok, lv, _html} = live(conn, "/prune?scope=node&node=other%40h")
+
+      lv
+      |> form("#prune-form",
+        prune: %{
+          scope: "node",
+          node: "other@h",
+          level: "all",
+          from: "2026-01-01T00:00:00Z",
+          to: "2026-02-01T00:00:00Z"
+        }
+      )
+      |> render_submit()
+
+      assert has_element?(lv, "#prune-confirm")
+
+      lv |> element(~s(#prune-node-options [data-node="#{tag}"])) |> render_click()
+
+      # The confirmation for the other scope is gone; deleting still requires
+      # a fresh preview and confirm for the newly selected node.
+      refute has_element?(lv, "#prune-confirm")
+      assert prune_field(lv, "prune_node") == tag
+    end
+
+    test "clicking a level selects it and keeps scope and range", %{conn: conn} do
+      {:ok, lv, _html} =
+        live(conn, "/prune?scope=node&node=a%40h&from=2026-01-01T00:00:00Z")
+
+      render_click(lv, "select-level", %{"level" => "error"})
+
+      assert has_element?(
+               lv,
+               "#prune-form select[name='prune[level]'] option[selected][value='error']"
+             )
+
+      assert has_element?(
+               lv,
+               "#prune-form select[name='prune[scope]'] option[selected][value='node']"
+             )
+
+      assert prune_field(lv, "prune_node") == "a@h"
+      assert prune_field(lv, "prune_from") == "2026-01-01T00:00:00Z"
+      refute has_element?(lv, "#prune-confirm")
+    end
+
+    test "clicking an unknown level or a blank node is ignored", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, "/prune?scope=node&node=a%40h&level=error")
+
+      render_click(lv, "select-level", %{"level" => "fatal"})
+      render_click(lv, "select-node", %{"node" => "  "})
+
+      assert has_element?(
+               lv,
+               "#prune-form select[name='prune[level]'] option[selected][value='error']"
+             )
+
+      assert prune_field(lv, "prune_node") == "a@h"
+    end
+  end
+
   describe "index" do
     test "renders prune form", %{conn: conn} do
       {:ok, lv, _html} = live(conn, ~p"/prune")
@@ -394,6 +616,18 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
       |> render_click()
 
       assert has_element?(lv, "#prune-result")
+    end
+
+    test "confirming without a preview deletes nothing", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/prune")
+
+      # The confirm button is absent until a preview is pending, so the event is
+      # pushed directly. It must refuse rather than delete whatever the form
+      # currently holds.
+      render_click(lv, "confirm", %{})
+
+      assert has_element?(lv, "#prune-error")
+      refute has_element?(lv, "#prune-result")
     end
 
     test "visiting prune via GET performs no delete", %{conn: conn} do

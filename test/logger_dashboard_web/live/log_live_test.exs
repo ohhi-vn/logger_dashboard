@@ -80,6 +80,26 @@ defmodule LoggerDashboardWeb.LogLiveTest do
       # the rest of the query.
       assert lv |> element("#logs-filter-form") |> render() =~ "error"
     end
+
+    test "a rejected filter shows no total", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/logs?from=not-a-date")
+
+      assert has_element?(lv, "#logs-filter-error")
+      # A rejected request computed nothing, so no total from a previous
+      # filter set may remain on screen.
+      refute has_element?(lv, "#logs-total")
+    end
+
+    test "offers a handoff carrying the active filters to analysis", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, "/logs?node=a%40h&search=*boom*&level=error")
+
+      html = lv |> element("#logs-analyze") |> render()
+
+      assert html =~ "/analysis"
+      assert html =~ "node="
+      assert html =~ "search="
+      assert html =~ "level=error"
+    end
   end
 
   describe "index datetime controls" do
@@ -606,6 +626,57 @@ defmodule LoggerDashboardWeb.LogLiveTest do
     end
   end
 
+  describe "index total" do
+    @describetag :clickhouse
+
+    setup %{conn: conn} do
+      tag = "logtotal-#{System.system_time(:millisecond)}-#{:rand.uniform(1_000_000)}@host"
+      base = ~U[2026-01-01 00:00:00.000000Z]
+
+      rows =
+        for i <- 1..3 do
+          %{
+            id: Ash.UUID.generate(),
+            timestamp: DateTime.add(base, i, :hour),
+            level: "info",
+            message: "logtotal row #{i} #{tag}",
+            module: "Test",
+            file: nil,
+            line: nil,
+            function: nil,
+            metadata: %{},
+            node: tag
+          }
+        end
+
+      {:ok, _} = ClickhouseExLogger.Insert.insert(rows)
+      on_exit(fn -> ClickhouseExLogger.Repo.query("DELETE FROM logs WHERE node = ?", [tag]) end)
+
+      await_visible(tag, 3)
+
+      {:ok, conn: conn, tag: tag}
+    end
+
+    test "shows the count for the whole filtered result, not the page", %{conn: conn, tag: tag} do
+      {:ok, lv, _html} = live(conn, ~p"/logs?node=#{tag}")
+
+      assert has_element?(lv, "#logs-total", ~r/Total 3/)
+    end
+
+    test "the total follows the active filters", %{conn: conn, tag: tag} do
+      {:ok, lv, _html} = live(conn, "/logs?node=#{tag}&search=*logtotal%20row%202*")
+
+      assert has_element?(lv, "#logs-total", ~r/Total 1/)
+    end
+
+    test "an empty scope reports a zero total", %{conn: conn} do
+      {:ok, lv, _html} =
+        live(conn, ~p"/logs?node=no-such-node-#{System.unique_integer([:positive])}")
+
+      assert has_element?(lv, "#logs-total", ~r/Total 0/)
+    end
+  end
+
   describe "index export" do
     @describetag :clickhouse
 
@@ -887,6 +958,238 @@ defmodule LoggerDashboardWeb.LogLiveTest do
 
       lv |> element("#logs-export") |> render_click()
       assert_push_event(lv, "logs-download", %{body: "", filename: "logs-export.txt"})
+
+      assert {
+               lv |> element("#logs-filter-form") |> render(),
+               lv |> element("#logs-pagination") |> render(),
+               row_count(lv)
+             } == before
+    end
+  end
+
+  describe "index click-to-filter" do
+    test "toggling a node adds it to the scope and keeps other filters", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/logs?node=a%40h&level=error")
+
+      render_click(lv, "toggle-node", %{"node" => "b@h"})
+
+      assert has_element?(lv, ~s(#logs-active-nodes [data-node="a@h"]))
+      assert has_element?(lv, ~s(#logs-active-nodes [data-node="b@h"]))
+
+      # The other filters survive the toggle.
+      assert has_element?(lv, ~s(#filters_level option[value="error"][selected]))
+    end
+
+    test "toggling a selected node removes it, and the last one returns to all nodes", %{
+      conn: conn
+    } do
+      {:ok, lv, _html} = live(conn, "/logs?node=" <> URI.encode_www_form("a@h,b@h"))
+
+      render_click(lv, "toggle-node", %{"node" => "a@h"})
+
+      refute has_element?(lv, ~s(#logs-active-nodes [data-node="a@h"]))
+      assert has_element?(lv, ~s(#logs-active-nodes [data-node="b@h"]))
+
+      render_click(lv, "toggle-node", %{"node" => "b@h"})
+
+      assert has_element?(lv, "#logs-active-nodes[hidden]")
+    end
+
+    test "toggling a blank node value changes nothing", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/logs?node=a%40h")
+
+      render_click(lv, "toggle-node", %{"node" => "  "})
+
+      assert has_element?(lv, ~s(#logs-active-nodes [data-node="a@h"]))
+    end
+
+    test "clicking a level selects it and clicking all clears it", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/logs")
+
+      render_click(lv, "select-level", %{"level" => "warning"})
+
+      assert has_element?(lv, ~s(#filters_level option[value="warning"][selected]))
+      assert has_element?(lv, ~s(#logs-level-options [data-level="warning"][aria-pressed="true"]))
+
+      render_click(lv, "select-level", %{"level" => "info"})
+
+      assert has_element?(lv, ~s(#filters_level option[value="info"][selected]))
+
+      render_click(lv, "select-level", %{"level" => "all"})
+
+      assert has_element?(lv, ~s(#filters_level option[value="all"][selected]))
+    end
+
+    test "clicking an unknown level is ignored", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/logs?level=error")
+
+      render_click(lv, "select-level", %{"level" => "fatal"})
+
+      assert has_element?(lv, ~s(#filters_level option[value="error"][selected]))
+    end
+  end
+
+  describe "index columns" do
+    test "header names every column in order and offers resize handles", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/logs")
+
+      columns =
+        lv
+        |> element("#logs-header")
+        |> render()
+        |> LazyHTML.from_fragment()
+        |> LazyHTML.query("[data-role=log-column]")
+        |> Enum.map(&(&1 |> LazyHTML.attribute("data-column") |> List.first()))
+
+      assert columns == ["timestamp", "level", "node", "message", "source", "actions"]
+
+      for key <- ~w(ts level node source) do
+        assert has_element?(lv, ~s(#logs-header [data-resize="#{key}"]))
+      end
+    end
+  end
+
+  describe "index node options and row copy" do
+    @describetag :clickhouse
+
+    setup %{conn: conn} do
+      tag = "logcopy-#{System.system_time(:millisecond)}-#{:rand.uniform(1_000_000)}@host"
+      base = ~U[2026-07-01 00:00:00.000000Z]
+      # The tag rides along so `await_visible/2` can poll for every seeded row,
+      # including this one, by message.
+      long = String.duplicate("y", 5_000) <> " #{tag}"
+
+      rows = [
+        %{
+          id: Ash.UUID.generate(),
+          timestamp: DateTime.add(base, 1, :hour),
+          level: "error",
+          message: "copy full #{tag}",
+          module: "Test.Module",
+          file: "lib/test.ex",
+          line: 42,
+          function: "run/1",
+          metadata: %{},
+          node: tag
+        },
+        %{
+          id: Ash.UUID.generate(),
+          timestamp: DateTime.add(base, 2, :hour),
+          level: "info",
+          message: long,
+          module: nil,
+          file: nil,
+          line: nil,
+          function: nil,
+          metadata: %{},
+          node: tag
+        },
+        %{
+          id: Ash.UUID.generate(),
+          timestamp: DateTime.add(base, 3, :hour),
+          level: "debug",
+          message: "copy nonode #{tag}",
+          module: nil,
+          file: nil,
+          line: nil,
+          function: nil,
+          metadata: %{},
+          node: nil
+        }
+      ]
+
+      {:ok, _} = ClickhouseExLogger.Insert.insert(rows)
+
+      on_exit(fn ->
+        ClickhouseExLogger.Repo.query("DELETE FROM logs WHERE node = ?", [tag])
+
+        ClickhouseExLogger.Repo.query("DELETE FROM logs WHERE message LIKE ?", [
+          "%#{tag}%"
+        ])
+      end)
+
+      await_visible(tag, 3)
+
+      {:ok, conn: conn, tag: tag, long: long}
+    end
+
+    test "known nodes are offered independent of the current page", %{conn: conn, tag: tag} do
+      # The page itself matches nothing, yet the options still list the table's
+      # nodes rather than the page's.
+      {:ok, lv, _html} =
+        live(conn, ~p"/logs?node=no-such-node-#{System.unique_integer([:positive])}")
+
+      assert has_element?(lv, ~s(#logs-node-options [data-node="#{tag}"]))
+    end
+
+    test "clicking a node option toggles it through the URL scope", %{conn: conn, tag: tag} do
+      {:ok, lv, _html} = live(conn, ~p"/logs")
+
+      assert has_element?(lv, ~s(#logs-node-options [data-node="#{tag}"][aria-pressed="false"]))
+
+      lv |> element(~s(#logs-node-options [data-node="#{tag}"])) |> render_click()
+
+      assert has_element?(lv, ~s(#logs-node-options [data-node="#{tag}"][aria-pressed="true"]))
+      assert has_element?(lv, ~s(#logs-active-nodes [data-node="#{tag}"]))
+
+      lv |> element(~s(#logs-node-options [data-node="#{tag}"])) |> render_click()
+
+      assert has_element?(lv, "#logs-active-nodes[hidden]")
+    end
+
+    test "copying a row pushes its full export line", %{conn: conn, tag: tag} do
+      {:ok, lv, _html} = live(conn, ~p"/logs?node=#{tag}")
+
+      id = row_id(lv, "error")
+      lv |> element("#logs-copy-#{id}") |> render_click()
+
+      assert_push_event(lv, "logs-copy", %{body: body})
+
+      assert body ==
+               "2026-07-01 01:00:00 UTC error #{tag} copy full #{tag} Test.Module.run/1 lib/test.ex:42"
+    end
+
+    test "copying carries the untruncated message", %{conn: conn, tag: tag, long: long} do
+      {:ok, lv, _html} = live(conn, ~p"/logs?node=#{tag}")
+
+      # The row shows the message shortened...
+      html = lv |> element("#logs-list [data-level=info] [data-role=log-message]") |> render()
+      assert html =~ "…"
+
+      # ...while the copy carries it whole.
+      id = row_id(lv, "info")
+      lv |> element("#logs-copy-#{id}") |> render_click()
+
+      assert_push_event(lv, "logs-copy", %{body: body})
+      assert body =~ long
+      refute body =~ "…"
+    end
+
+    test "copying a node-less row uses the placeholder", %{conn: conn, tag: tag} do
+      # The node-less row is outside any node scope, so it is reached through
+      # the tag search rather than a node filter.
+      {:ok, lv, _html} = live(conn, "/logs?search=*#{tag}*&limit=100")
+
+      id = row_id(lv, "debug")
+      lv |> element("#logs-copy-#{id}") |> render_click()
+
+      assert_push_event(lv, "logs-copy", %{body: body})
+
+      assert body == "2026-07-01 03:00:00 UTC debug unknown copy nonode #{tag}"
+    end
+
+    test "copying leaves the page unchanged", %{conn: conn, tag: tag} do
+      {:ok, lv, _html} = live(conn, ~p"/logs?node=#{tag}")
+
+      before = {
+        lv |> element("#logs-filter-form") |> render(),
+        lv |> element("#logs-pagination") |> render(),
+        row_count(lv)
+      }
+
+      id = row_id(lv, "error")
+      lv |> element("#logs-copy-#{id}") |> render_click()
+      assert_push_event(lv, "logs-copy", %{})
 
       assert {
                lv |> element("#logs-filter-form") |> render(),

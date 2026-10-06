@@ -2,7 +2,10 @@ defmodule LoggerDashboardWeb.PruneLive.Index do
   @moduledoc "Prune logs by node or whole system with explicit confirmation."
   use LoggerDashboardWeb, :live_view
 
+  alias LoggerDashboard.Logs.ClickHouseError
   alias LoggerDashboard.Logs.Filter
+  alias LoggerDashboard.Logs.LogLine
+  alias LoggerDashboard.Logs.LogRead
   alias LoggerDashboard.Logs.Prune
   alias LoggerDashboard.Retention.Policy
   alias LoggerDashboard.Retention.Scheduler
@@ -20,10 +23,13 @@ defmodule LoggerDashboardWeb.PruneLive.Index do
       socket
       |> assign(:page_title, "Prune logs")
       |> assign(:prune_params, %{"scope" => "node"})
+      |> assign(:node_options, [])
       |> assign(:form, to_form(%{"scope" => "node"}, as: :prune))
       |> assign(:preview, nil)
       |> assign(:preview_filter, nil)
       |> assign(:preview_scope, nil)
+      |> assign(:preview_count, nil)
+      |> assign(:preview_rows, [])
       |> assign(:result, nil)
       |> assign(:error, nil)
       # Assigned here rather than only in `assign_retention/1` so every path into
@@ -63,6 +69,7 @@ defmodule LoggerDashboardWeb.PruneLive.Index do
          |> assign(:prune_params, prune_params)
          |> assign(:form, to_form(form_params, as: :prune))
          |> assign(:error, nil)
+         |> load_node_options()
          |> clear_preview()}
 
       {:error, message} ->
@@ -72,6 +79,7 @@ defmodule LoggerDashboardWeb.PruneLive.Index do
          socket
          |> assign(:prune_params, prune_params)
          |> assign(:form, to_form(prune_params, as: :prune))
+         |> assign(:node_options, [])
          |> assign(:error, message)
          |> clear_preview()}
     end
@@ -91,6 +99,43 @@ defmodule LoggerDashboardWeb.PruneLive.Index do
   end
 
   @impl true
+  def handle_event("select-node", %{"node" => node}, socket) do
+    # A click selects the single-node scope for that value and then stops: it
+    # replaces any previously entered node, keeps range and level, and reaches
+    # no prune code at all. The patch round-trips through `handle_params`,
+    # which clears any pending preview, so a stale confirmation for another
+    # scope can never survive the click — deleting still requires an explicit
+    # preview and confirm afterwards.
+    case String.trim(to_string(node)) do
+      "" ->
+        {:noreply, socket}
+
+      name ->
+        params =
+          socket.assigns.prune_params
+          |> Map.put("scope", "node")
+          |> Map.put("node", name)
+
+        {:noreply, push_patch(socket, to: ~p"/prune?#{params}")}
+    end
+  end
+
+  @impl true
+  def handle_event("select-level", %{"level" => level}, socket) do
+    # Single-select through the same `level` param the form submits. An unknown
+    # level is ignored here; hand-typed values travel the form path where
+    # `Prune.parse/1` reports them.
+    level = level |> to_string() |> String.trim() |> String.downcase()
+
+    if level in Filter.levels() do
+      params = Map.put(socket.assigns.prune_params, "level", level)
+      {:noreply, push_patch(socket, to: ~p"/prune?#{params}")}
+    else
+      {:noreply, socket}
+    end
+  end
+
+  @impl true
   def handle_event("preview", params, socket) do
     attrs = prune_attrs(params)
 
@@ -104,6 +149,7 @@ defmodule LoggerDashboardWeb.PruneLive.Index do
           |> assign(:preview_scope, scope)
           |> assign(:result, nil)
           |> assign(:error, nil)
+          |> load_preview(filter)
 
         {:noreply, socket}
 
@@ -123,9 +169,7 @@ defmodule LoggerDashboardWeb.PruneLive.Index do
   def handle_event("cancel", _params, socket) do
     {:noreply,
      socket
-     |> assign(:preview, nil)
-     |> assign(:preview_filter, nil)
-     |> assign(:preview_scope, nil)
+     |> clear_preview()
      |> assign(:error, nil)}
   end
 
@@ -141,9 +185,7 @@ defmodule LoggerDashboardWeb.PruneLive.Index do
             {:noreply,
              socket
              |> assign(:result, message)
-             |> assign(:preview, nil)
-             |> assign(:preview_filter, nil)
-             |> assign(:preview_scope, nil)
+             |> clear_preview()
              |> assign(:error, nil)}
 
           {:error, message} ->
@@ -324,6 +366,36 @@ defmodule LoggerDashboardWeb.PruneLive.Index do
     |> assign(:preview, nil)
     |> assign(:preview_filter, nil)
     |> assign(:preview_scope, nil)
+    |> assign(:preview_count, nil)
+    |> assign(:preview_rows, [])
+  end
+
+  # Resolve what the parsed filter would delete, into the confirmation. A read
+  # failure clears the preview and reports it instead of arming a delete whose
+  # blast radius is unknown: the count and sample are part of the confirmation,
+  # not decoration.
+  defp load_preview(socket, filter) do
+    case Prune.preview(filter) do
+      {:ok, %{count: count, rows: rows}} ->
+        assign(socket, :preview_count, count)
+        |> assign(:preview_rows, rows)
+
+      {:error, error} ->
+        socket
+        |> clear_preview()
+        |> assign(:error, ClickHouseError.friendly(error))
+    end
+  end
+
+  # Node options describe the table, not the scope in view, so every known node
+  # is offered even when the page targets one of them. A failed options read
+  # leaves an empty list rather than an error — the node input remains usable
+  # either way.
+  defp load_node_options(socket) do
+    case LogRead.list_nodes() do
+      {:ok, nodes} -> assign(socket, :node_options, nodes)
+      {:error, _error} -> assign(socket, :node_options, [])
+    end
   end
 
   defp iso_second(%DateTime{} = datetime) do
@@ -342,6 +414,66 @@ defmodule LoggerDashboardWeb.PruneLive.Index do
           <p class="text-sm text-base-content/70">
             Delete logs for one node or the whole system. ClickHouse applies deletes asynchronously and they cannot be undone.
           </p>
+        </div>
+
+        <%!-- Clickable node options, sourced from the table rather than the
+              scope in view. A click selects the single-node scope for that
+              value — replacing whatever the input holds — and then stops: the
+              text input stays as the fallback, and deleting still requires an
+              explicit preview and confirm. --%>
+        <div id="prune-node-options" class="flex flex-wrap items-center gap-2 text-sm">
+          <span class="text-base-content/70">Nodes:</span>
+          <button
+            :for={node <- @node_options}
+            type="button"
+            id={"prune-node-#{Base.url_encode64(node, padding: false)}"}
+            phx-click="select-node"
+            phx-value-node={node}
+            data-node={node}
+            aria-pressed={
+              to_string(@prune_params["scope"] == "node" && @prune_params["node"] == node)
+            }
+            title={"Prune single-node scope for #{node} (still requires preview and confirm)"}
+            class={[
+              "badge cursor-pointer border",
+              @prune_params["scope"] == "node" && @prune_params["node"] == node && "badge-primary",
+              (@prune_params["scope"] != "node" || @prune_params["node"] != node) &&
+                "badge-outline badge-ghost hover:badge-primary"
+            ]}
+          >
+            {node}
+          </button>
+          <span :if={@node_options == []} class="text-xs text-base-content/50">
+            No known nodes — type one below.
+          </span>
+        </div>
+
+        <%!-- Clickable single-select levels through the same `level` param the
+              form submits. --%>
+        <div
+          id="prune-level-options"
+          class="flex flex-wrap items-center gap-2 text-sm"
+          role="group"
+          aria-label="Level filter"
+        >
+          <span class="text-base-content/70">Level:</span>
+          <button
+            :for={level <- Filter.levels()}
+            type="button"
+            id={"prune-level-#{level}"}
+            phx-click="select-level"
+            phx-value-level={level}
+            data-level={level}
+            aria-pressed={to_string(Map.get(@prune_params, "level", "all") == level)}
+            class={[
+              "badge cursor-pointer border uppercase",
+              Map.get(@prune_params, "level", "all") == level && "badge-primary",
+              Map.get(@prune_params, "level", "all") != level &&
+                "badge-outline badge-ghost hover:badge-primary"
+            ]}
+          >
+            {level}
+          </button>
         </div>
 
         <.form
@@ -390,6 +522,37 @@ defmodule LoggerDashboardWeb.PruneLive.Index do
           <div class="space-y-3 rounded-xl border border-error/40 bg-base-100 p-4" id="prune-confirm">
             <p class="font-semibold">Confirm prune</p>
             <p class="text-sm" id="prune-preview-scope">This will delete logs for: {@preview}</p>
+            <%!-- The count the delete will act on, from the same validated
+                  filter, so the confirmation states the blast radius rather
+                  than only the scope text. --%>
+            <p class="text-sm font-medium" id="prune-preview-count">
+              Rows that will be deleted: {@preview_count}
+            </p>
+            <%!-- A bounded sample of the newest matching rows, so a wrong
+                  node or window is visible before confirming. Zero matching
+                  rows shows the count alone, with no sample table. --%>
+            <div :if={@preview_rows != []} id="prune-preview-rows" class="overflow-x-auto">
+              <table class="table table-xs">
+                <thead>
+                  <tr>
+                    <th>Timestamp</th>
+                    <th>Level</th>
+                    <th>Node</th>
+                    <th>Message</th>
+                    <th>Source</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr :for={row <- @preview_rows} data-role="prune-preview-row">
+                    <td class="whitespace-nowrap">{LogLine.timestamp(row)}</td>
+                    <td>{LogLine.level(row)}</td>
+                    <td>{LogLine.node_name(row)}</td>
+                    <td class="break-words whitespace-pre-wrap">{LogLine.message(row)}</td>
+                    <td>{LogLine.location(row) || "—"}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
             <p class="text-xs text-base-content/70">
               Async apply; no undo. Whole-system prunes delete every node.
             </p>

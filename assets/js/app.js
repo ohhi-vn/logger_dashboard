@@ -61,6 +61,91 @@ window.addEventListener("phx:logs-download", ({detail}) => {
   setTimeout(() => URL.revokeObjectURL(url), 0)
 })
 
+// A single log row pushed by the server for the clipboard. Mirrors the
+// logs-download flow above, but writes text instead of a file. The body is the
+// row's export line, so copy and export cannot disagree. On denial the row's
+// expanded panel holds the same text, and a notice says so rather than failing
+// silently.
+window.addEventListener("phx:logs-copy", async ({detail}) => {
+  const write = async () => {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(detail.body)
+      return true
+    }
+
+    // Fallback for contexts without the async clipboard API.
+    const area = document.createElement("textarea")
+    area.value = detail.body
+    area.style.position = "fixed"
+    area.style.opacity = "0"
+    document.body.appendChild(area)
+    area.select()
+
+    let ok = false
+    try {
+      ok = document.execCommand("copy")
+    } catch {
+      ok = false
+    }
+    document.body.removeChild(area)
+    return ok
+  }
+
+  let ok = false
+  try {
+    ok = await write()
+  } catch {
+    ok = false
+  }
+
+  if (!ok) {
+    const note = document.createElement("div")
+    note.setAttribute("role", "alert")
+    note.className = "alert alert-warning fixed bottom-4 right-4 z-50 w-auto shadow-lg"
+    note.textContent = "Could not copy to clipboard — expand the row to select the text manually."
+    document.body.appendChild(note)
+    setTimeout(() => note.remove(), 4000)
+  }
+})
+
+// Column resize for the log viewer table. Widths live in CSS variables on
+// #logs-table, so they survive LiveView stream re-inserts and are never sent
+// to the server or written into the URL. The message column has no handle and
+// flexes into whatever the fixed columns leave behind.
+const logsResizeVars = {
+  ts: "--logs-col-ts",
+  level: "--logs-col-level",
+  node: "--logs-col-node",
+  source: "--logs-col-source"
+}
+
+document.addEventListener("mousedown", (e) => {
+  const handle = e.target.closest("[data-resize]")
+  if (!handle) return
+
+  const table = handle.closest("#logs-table")
+  const variable = logsResizeVars[handle.getAttribute("data-resize")]
+  if (!table || !variable) return
+
+  e.preventDefault()
+
+  const startX = e.clientX
+  const startWidth = handle.parentElement.getBoundingClientRect().width
+  const minWidth = 48
+
+  const onMove = (move) => {
+    const width = Math.max(minWidth, startWidth + move.clientX - startX)
+    table.style.setProperty(variable, `${width}px`)
+  }
+  const onUp = () => {
+    document.removeEventListener("mousemove", onMove)
+    document.removeEventListener("mouseup", onUp)
+  }
+
+  document.addEventListener("mousemove", onMove)
+  document.addEventListener("mouseup", onUp)
+})
+
 // connect if there are any LiveViews on the page
 liveSocket.connect()
 

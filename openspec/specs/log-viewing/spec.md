@@ -10,7 +10,7 @@ Lets operators browse logs shipped by `clickhouse_ex_logger` from a single place
 
 The system SHALL list log rows from the shared `logs` table scoped to zero, one, or more selected nodes, defaulting to newest-first by `timestamp`. A scope with no selected node SHALL include every node, including rows where `node` is NULL. A scope with one or more selected nodes SHALL match rows whose `node` equals any selected value.
 
-Each row SHALL be rendered as a single line rather than as a stacked card, carrying the UTC `timestamp`, `level`, `node`, `message`, and the available source location on that one line. The row SHALL carry a visual accent keyed to its level so that `error` and `warning` rows are distinguishable while scanning. Level SHALL remain readable as text and SHALL NOT be conveyed by color alone.
+Each row SHALL be rendered as a single line rather than as a stacked card, carrying the UTC `timestamp`, `level`, `node`, `message`, and the available source location on that one line. The row SHALL carry a visual accent keyed to its level so that `error` and `warning` rows are distinguishable while scanning. Level SHALL remain readable as text and SHALL NOT be conveyed by color alone. The list SHALL present explicit columns for `timestamp`, `level`, `node`, `message`, and source location, and the columns SHALL be resizable by the user without changing the rows, filters, or page position.
 
 A row SHALL NOT exceed a single line's height. A `message` too long to fit within the available width SHALL be shortened with a trailing ellipsis on the row, and the untruncated message SHALL remain reachable: it is exposed on hover and shown in full when that row is expanded. Nothing in the shortening SHALL be discarded from the system, and the export of that page SHALL carry the untruncated message. Expanding a row SHALL reveal the full `message` and, when the row carries them, its `metadata`; it SHALL NOT change the page's filters, its page position, or the rows on the page.
 
@@ -101,6 +101,21 @@ Spacing between and within rows SHALL be tight enough that the rows in a page ar
 - **THEN** the spacing within and between the rows is tight enough that the
   page reads as a continuous list of log lines rather than as separated cards
 
+#### Scenario: Columns are explicit
+
+- **WHEN** a page shows log rows
+- **THEN** each row exposes distinct `timestamp`, `level`, `node`, `message`, and source-location columns in a consistent order
+
+#### Scenario: Columns are resizable
+
+- **WHEN** user resizes a column
+- **THEN** that column's width changes while the rows, filters, and page position stay unchanged
+
+#### Scenario: Expanding a row does not disturb column widths
+
+- **WHEN** user expands a row after resizing columns
+- **THEN** the chosen column widths are preserved
+
 ### Requirement: Wildcard text search
 
 The system SHALL support wildcard text search over `message` (e.g. `*timeout*`, `db_*`) translated to a ClickHouse `LIKE`/`match` predicate. The predicate SHALL be evaluated by the database against every row in the active scope, not applied in application memory to a bounded subset.
@@ -141,7 +156,7 @@ The system SHALL filter by an explicit UTC datetime range on `timestamp` with in
 
 ### Requirement: Level filter
 
-The system SHALL filter by log level for `error`, `warning`, `info`, `debug`, plus `all`.
+The system SHALL filter by log level for `error`, `warning`, `info`, `debug`, plus `all`. It SHALL present each level as a clickable option, and clicking an option SHALL select that level as the active level filter. Selecting `all` SHALL apply no level predicate.
 
 #### Scenario: Filter by single level
 
@@ -152,6 +167,22 @@ The system SHALL filter by log level for `error`, `warning`, `info`, `debug`, pl
 
 - **WHEN** user selects `all`
 - **THEN** system applies no level predicate
+
+#### Scenario: Clicking a level selects it
+
+- **WHEN** user clicks the `warning` level option
+- **THEN** system shows only rows where `level` equals `warning` and marks `warning` as the active level
+
+#### Scenario: Clicking levels replaces the previous level
+
+- **WHEN** user clicks level `info` while level `error` is active
+- **THEN** system shows only rows where `level` equals `info`
+
+#### Scenario: Clicking all clears the level filter
+
+- **WHEN** user clicks the `all` level option while a single level is active
+- **THEN** system applies no level predicate and marks `all` as active
+
 ### Requirement: Paginated newest-first browsing
 
 The system SHALL paginate log results with limit/offset and preserve active filters across pages. Pages SHALL be drawn from the complete set of rows matching the active filters.
@@ -161,6 +192,8 @@ The per-page row count SHALL be selectable from 100, 500, and 3000, and 100 SHAL
 A page size carried in the URL that reads as a positive whole number SHALL be honoured, so a page size that is no longer offered but still reachable by an existing link keeps working. A page size above 3000 SHALL be capped at 3000. A page size that does not read as a positive whole number SHALL fall back to 100 rather than being rejected.
 
 Whether further pages exist SHALL be determined from the rows actually matching the active filters, not inferred from the current page being full. A page holding exactly the per-page row count SHALL report that no further pages exist when no further rows match. The rows used to determine this SHALL NOT be shown on the page, so a page holds at most the selected number of rows and an export of that page contains exactly the rows displayed.
+
+The system SHALL show the total number of rows matching the active filters (node, search, datetime-range, level) alongside the pagination controls. The total SHALL be computed from the same predicates as the page rows, SHALL update whenever any active filter changes, and SHALL read zero when no rows match. A filter the system rejects SHALL show no total rather than a stale total from a previous request.
 
 #### Scenario: Paginate filtered logs
 
@@ -236,9 +269,29 @@ Whether further pages exist SHALL be determined from the rows actually matching 
   number
 - **THEN** system uses 100 and reports no error
 
+#### Scenario: Total reflects the active filters
+
+- **WHEN** user views the Logs page with node, search, datetime-range, and level filters active
+- **THEN** system shows the count of all rows matching those filters, not just the rows on the current page
+
+#### Scenario: Total updates with filters
+
+- **WHEN** user changes any active filter and the page reloads
+- **THEN** the shown total matches the new filter set
+
+#### Scenario: Empty scope shows zero total
+
+- **WHEN** no rows match the active filters
+- **THEN** system shows a total of zero alongside the empty state
+
+#### Scenario: Rejected filter shows no total
+
+- **WHEN** user submits a filter the system rejects
+- **THEN** system shows the validation error and no total from a previous request
+
 ### Requirement: Multi-value node input
 
-The system SHALL accept a node filter containing one or more node names separated by commas. It SHALL trim surrounding whitespace from each entry, ignore blank entries, and treat an input that reduces to no entries as "all nodes". It SHALL display the active node scope on the page and provide a single action that clears the node filter back to all nodes.
+The system SHALL accept a node filter containing one or more node names separated by commas. It SHALL trim surrounding whitespace from each entry, ignore blank entries, and treat an input that reduces to no entries as "all nodes". It SHALL display the active node scope on the page and provide a single action that clears the node filter back to all nodes. It SHALL additionally present the known nodes as clickable options alongside the text input, and clicking an option SHALL toggle that node in or out of the active scope without disturbing the other active filters.
 
 #### Scenario: Comma-separated nodes parse to a set
 
@@ -259,6 +312,40 @@ The system SHALL accept a node filter containing one or more node names separate
 
 - **WHEN** a node filter is active
 - **THEN** system shows the selected nodes on the page and offers a clear action that returns to all nodes
+
+#### Scenario: Clicking an unselected node adds it to the scope
+
+- **WHEN** user clicks a node option that is not in the active scope
+- **THEN** system adds that node to the scope and refreshes the rows while keeping search, datetime-range, level, and pagination position semantics for the new scope
+
+#### Scenario: Clicking a selected node removes it from the scope
+
+- **WHEN** user clicks a node option that is already in the active scope
+- **THEN** system removes that node from the scope, and removing the last selected node returns to all nodes
+
+#### Scenario: Clicking nodes preserves other filters
+
+- **WHEN** user toggles a node option while search, datetime-range, or level filters are active
+- **THEN** system keeps those filters unchanged and applies them together with the new node scope
+
+### Requirement: Distinct node options
+
+The system SHALL list the distinct node values present in the shared `logs` table as selectable options for the node filter. The list SHALL reflect nodes recently observed in the table, SHALL be ordered for scanning, and SHALL exclude no node merely because it is absent from the current page of rows.
+
+#### Scenario: Known nodes are offered as options
+
+- **WHEN** the table contains rows from `my_app@10.0.0.5` and `my_app@10.0.0.6`
+- **THEN** system offers both values as node options
+
+#### Scenario: Options are independent of the current page
+
+- **WHEN** the current page shows rows from only one node while the table holds more nodes
+- **THEN** system still offers every distinct node, not only the nodes on the page
+
+#### Scenario: Empty table offers no node options
+
+- **WHEN** the table holds no rows with a node value
+- **THEN** system offers no node options and the text input remains usable
 
 ### Requirement: Export the current page as raw text
 
@@ -337,3 +424,46 @@ The file SHALL be served as plain text with a name that identifies it as a log e
 
 - **WHEN** user exports a page showing no rows
 - **THEN** the download succeeds and the file contains no rows
+
+### Requirement: Copy log row as text
+
+The system SHALL offer a per-row action that copies that row's full record as text, carrying the UTC `timestamp`, the `level`, the `node` (or the explicit placeholder for a row with no node), the untruncated `message`, and the source location when the row has one. The copied text SHALL use the same field order and escaping as the page export, and copying SHALL NOT change the page's filters, its page position, or the rows shown.
+
+#### Scenario: Copying a row copies its full info
+
+- **WHEN** user triggers the copy action on a row
+- **THEN** the clipboard receives that row's UTC `timestamp`, `level`, `node`, untruncated `message`, and source location when present
+
+#### Scenario: Copying a node-less row uses the placeholder
+
+- **WHEN** user copies a row whose `node` is absent
+- **THEN** the copied text carries the explicit node placeholder rather than an empty field
+
+#### Scenario: Copying carries the untruncated message
+
+- **WHEN** user copies a row whose message is shortened on the row
+- **THEN** the copied text carries the full untruncated message
+
+#### Scenario: Copying does not disturb the page
+
+- **WHEN** user copies a row
+- **THEN** the page's filters, its page position, and the rows shown are unchanged
+
+### Requirement: Logs-to-analysis handoff
+
+The system SHALL offer a handoff action on the Logs page that navigates to `/analysis` carrying the active `node`, `search`, `from`, `to`, and `level` filters, so the Analysis page opens on the same scope without retyping. The handoff SHALL preserve every active filter value as typed and SHALL NOT alter the Logs page filters, page position, or rows shown.
+
+#### Scenario: Handoff carries active filters to analysis
+
+- **WHEN** user triggers the handoff with node, search, datetime-range, and level filters active on the Logs page
+- **THEN** the Analysis page opens with those same node, search, datetime-range, and level values applied
+
+#### Scenario: Handoff with no filters opens unscoped analysis
+
+- **WHEN** user triggers the handoff with no filters active on the Logs page
+- **THEN** the Analysis page opens in whole-system scope with no search keyword
+
+#### Scenario: Handoff does not disturb the Logs page
+
+- **WHEN** user triggers the handoff
+- **THEN** the Logs page filters, page position, and rows shown are unchanged

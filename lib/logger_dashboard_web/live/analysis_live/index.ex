@@ -5,8 +5,9 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
   alias LoggerDashboard.Logs.Analysis
   alias LoggerDashboard.Logs.ClickHouseError
   alias LoggerDashboard.Logs.Filter
+  alias LoggerDashboard.Logs.LogRead
 
-  @filter_keys ["node", "from", "to", "preset", "level", "bucket"]
+  @filter_keys ["node", "search", "from", "to", "preset", "level", "bucket"]
 
   @impl true
   def mount(_params, _session, socket) do
@@ -15,6 +16,7 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
       |> assign(:page_title, "Analysis")
       |> assign(:filter_params, %{})
       |> assign(:nodes_selected, [])
+      |> assign(:node_options, [])
       |> assign(:form, to_form(%{}, as: :filters))
       |> assign(:levels, nil)
       |> assign(:volume, nil)
@@ -54,10 +56,12 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
           # applied, including the instants a `preset` resolved to.
           |> assign(:form, to_form(form_params(filter, bucket), as: :filters))
           |> load_analysis(filter, bucket)
+          |> load_node_options()
 
         {:error, message} ->
           socket
           |> assign(:form, to_form(filter_params, as: :filters))
+          |> assign(:node_options, [])
           # Assigned last, so clearing the results cannot take the rejection
           # with it.
           |> clear_results()
@@ -99,6 +103,49 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
     # nodes does not widen the window the user chose.
     params = Map.delete(socket.assigns.filter_params, "node")
     {:noreply, push_patch(socket, to: ~p"/analysis?#{params}")}
+  end
+
+  @impl true
+  def handle_event("toggle-node", %{"node" => node}, socket) do
+    # Same toggle shape as the logs page: read the scope back from the URL
+    # params so the toggle works while a validation error is shown, and write
+    # back through the same `node` param so parsing stays the single
+    # validator. Range, level, and bucket ride along untouched.
+    case String.trim(to_string(node)) do
+      "" ->
+        {:noreply, socket}
+
+      name ->
+        nodes = Filter.parse_nodes(socket.assigns.filter_params)
+
+        nodes =
+          if name in nodes,
+            do: Enum.reject(nodes, &(&1 == name)),
+            else: Enum.uniq(nodes ++ [name])
+
+        params =
+          case Filter.nodes_to_param(nodes) do
+            "" -> Map.delete(socket.assigns.filter_params, "node")
+            param -> Map.put(socket.assigns.filter_params, "node", param)
+          end
+
+        {:noreply, push_patch(socket, to: ~p"/analysis?#{params}")}
+    end
+  end
+
+  @impl true
+  def handle_event("select-level", %{"level" => level}, socket) do
+    # Single-select through the same `level` param the form submits. An unknown
+    # level is ignored here; hand-typed values travel the form path where
+    # `Filter.parse/1` reports them.
+    level = level |> to_string() |> String.trim() |> String.downcase()
+
+    if level in Filter.levels() do
+      params = Map.put(socket.assigns.filter_params, "level", level)
+      {:noreply, push_patch(socket, to: ~p"/analysis?#{params}")}
+    else
+      {:noreply, socket}
+    end
   end
 
   defp allowed_filters(params) do
@@ -181,6 +228,16 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
         socket
         |> clear_results()
         |> assign(:analysis_error, ClickHouseError.friendly(error))
+    end
+  end
+
+  # Node options describe the table, not the scope in view, so a filtered page
+  # still offers every known node. A failed options read leaves an empty list
+  # rather than an error — the comma text input remains usable either way.
+  defp load_node_options(socket) do
+    case LogRead.list_nodes() do
+      {:ok, nodes} -> assign(socket, :node_options, nodes)
+      {:error, _error} -> assign(socket, :node_options, [])
     end
   end
 
@@ -268,17 +325,81 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
         </span>
       </div>
 
+      <%!-- Clickable node options, sourced from the table rather than the page.
+            A click toggles the node through the same `node` param as the text
+            input, which stays as the fallback for unknown or off-list names. --%>
+      <div id="analysis-node-options" class="flex flex-wrap items-center gap-2 text-sm">
+        <span class="text-base-content/70">All nodes:</span>
+        <button
+          :for={node <- @node_options}
+          type="button"
+          id={"analysis-node-#{Base.url_encode64(node, padding: false)}"}
+          phx-click="toggle-node"
+          phx-value-node={node}
+          data-node={node}
+          aria-pressed={to_string(node in @nodes_selected)}
+          title={
+            if node in @nodes_selected, do: "Remove #{node} from scope", else: "Add #{node} to scope"
+          }
+          class={[
+            "badge cursor-pointer border",
+            node in @nodes_selected && "badge-primary",
+            node not in @nodes_selected && "badge-outline badge-ghost hover:badge-primary"
+          ]}
+        >
+          {node}
+        </button>
+        <span :if={@node_options == []} class="text-xs text-base-content/50">
+          No known nodes — type one below.
+        </span>
+      </div>
+
+      <%!-- Clickable single-select levels through the same `level` param the
+            form submits, so validation and bookmarks stay unified. --%>
+      <div
+        id="analysis-level-options"
+        class="flex flex-wrap items-center gap-2 text-sm"
+        role="group"
+        aria-label="Level filter"
+      >
+        <span class="text-base-content/70">Level:</span>
+        <button
+          :for={level <- Filter.levels()}
+          type="button"
+          id={"analysis-level-#{level}"}
+          phx-click="select-level"
+          phx-value-level={level}
+          data-level={level}
+          aria-pressed={to_string(Map.get(@filter_params, "level", "all") == level)}
+          class={[
+            "badge cursor-pointer border uppercase",
+            Map.get(@filter_params, "level", "all") == level && "badge-primary",
+            Map.get(@filter_params, "level", "all") != level &&
+              "badge-outline badge-ghost hover:badge-primary"
+          ]}
+        >
+          {level}
+        </button>
+      </div>
+
       <.form
         for={@form}
         id="analysis-filter-form"
         phx-submit="filter"
-        class="grid grid-cols-1 gap-3 rounded-xl border border-base-300 bg-base-100 p-4 md:grid-cols-5"
+        class="grid grid-cols-1 gap-3 rounded-xl border border-base-300 bg-base-100 p-4 md:grid-cols-6"
       >
         <div class="md:col-span-2">
           <.input
             field={@form[:node]}
             label="Nodes (comma-separated, blank = all)"
             placeholder="my_app@10.0.0.5, my_app@10.0.0.6"
+          />
+        </div>
+        <div class="md:col-span-2">
+          <.input
+            field={@form[:search]}
+            label="Search (* wildcards)"
+            placeholder="*timeout*"
           />
         </div>
         <.bound id="analysis" bound={:from} field={@form[:from]} label="From (UTC)" />
@@ -290,7 +411,7 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
           options={["all", "error", "warning", "info", "debug"]}
         />
         <.input field={@form[:bucket]} label="Bucket" type="select" options={["hour", "day"]} />
-        <div class="md:col-span-5 flex flex-wrap items-center justify-between gap-2">
+        <div class="md:col-span-6 flex flex-wrap items-center justify-between gap-2">
           <div class="flex gap-2">
             <.button>Run analysis</.button>
             <.link navigate={~p"/analysis"} class="btn btn-ghost">Reset</.link>

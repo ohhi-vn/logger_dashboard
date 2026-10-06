@@ -19,6 +19,10 @@ defmodule LoggerDashboard.Logs.LogRead do
 
   @unrecognized_response_format "ClickHouse returned an unrecognized response format for the log read."
 
+  @doc "Maximum node options listed for the viewer filter."
+  @spec node_options_limit() :: pos_integer()
+  def node_options_limit, do: 200
+
   @doc """
   Column names for the raw projection, derived from `LogView` public attributes.
 
@@ -78,6 +82,37 @@ defmodule LoggerDashboard.Logs.LogRead do
     end
   end
 
+  @doc """
+  Count every log row matching `filter`, not just one page.
+
+  Issues `SELECT COUNT(*)` over the same `Filter.predicates/1` clause and bound
+  parameters as `list_logs/2`, so the total a page reports can never describe a
+  different filter set than the rows it shows. Cheap in ClickHouse and the only
+  way to answer the question without inferring it from a page's length.
+
+  A `nil` rows field is reported as a failure rather than as a zero count, for
+  the same reason `handle_result/1` does: an undecodable response must not read
+  as "no logs".
+  """
+  @spec count_logs(Filter.t()) :: {:ok, non_neg_integer()} | {:error, term()}
+  def count_logs(%Filter{} = filter) do
+    {where, params} = Filter.predicates(filter)
+
+    sql = """
+    SELECT COUNT(*)
+    FROM #{table()}
+    WHERE #{where}
+    """
+
+    count_result(ClickhouseExLogger.Repo.query(sql, params))
+  end
+
+  @doc false
+  @spec count_result(term()) :: {:ok, non_neg_integer()} | {:error, term()}
+  def count_result({:ok, %{rows: [[count]]}}) when is_integer(count), do: {:ok, count}
+  def count_result({:ok, _other}), do: {:error, @unrecognized_response_format}
+  def count_result({:error, error}), do: {:error, error}
+
   @doc false
   @spec handle_result(term()) :: {:ok, [map()]} | {:error, term()}
   def handle_result({:ok, %{rows: rows}}) when is_list(rows), do: {:ok, decode(rows)}
@@ -88,6 +123,49 @@ defmodule LoggerDashboard.Logs.LogRead do
   def handle_result({:ok, _other}), do: {:error, @unrecognized_response_format}
 
   def handle_result({:error, error}), do: {:error, error}
+
+  @doc """
+  List distinct node values present in the `logs` table, ordered for scanning.
+
+  Backs the viewer's clickable node options. Rows with `NULL` or empty nodes
+  are excluded from the options, while the all-nodes scope still includes them.
+  Bounded by `node_options_limit/0` so a large fleet cannot inflate the filter;
+  the comma text input remains the fallback for nodes outside the bound.
+
+  Every value is a bound parameter and no user input reaches the SQL string:
+  the only parameter is the internal limit.
+  """
+  @spec list_nodes(pos_integer()) :: {:ok, [String.t()]} | {:error, term()}
+  def list_nodes(limit \\ 200)
+
+  def list_nodes(limit) when is_integer(limit) and limit > 0 do
+    limit = min(limit, 1000)
+    node = AshClickhouse.Identifier.quote_name(:node)
+
+    sql = """
+    SELECT DISTINCT #{node}
+    FROM #{table()}
+    WHERE #{node} IS NOT NULL AND #{node} != ''
+    ORDER BY #{node} ASC
+    LIMIT ?
+    """
+
+    case ClickhouseExLogger.Repo.query(sql, [limit]) do
+      {:ok, %{rows: rows}} when is_list(rows) ->
+        nodes =
+          for [value] <- rows,
+              is_binary(value) and value != "",
+              do: value
+
+        {:ok, nodes}
+
+      {:ok, _other} ->
+        {:error, @unrecognized_response_format}
+
+      {:error, error} ->
+        {:error, error}
+    end
+  end
 
   @doc false
   @spec decode([list()]) :: [map()]

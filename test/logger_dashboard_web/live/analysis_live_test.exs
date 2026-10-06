@@ -112,6 +112,99 @@ defmodule LoggerDashboardWeb.AnalysisLiveTest do
       assert has_element?(lv, "#analysis-active-nodes[hidden]")
       assert has_element?(lv, "#analysis-shortcuts [data-preset='window:1h'][aria-pressed=true]")
     end
+
+    test "offers a search input that round-trips a keyword", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, "/analysis?search=*timeout*")
+
+      assert input_value(lv, "filters_search") == "*timeout*"
+
+      lv
+      |> form("#analysis-filter-form", filters: %{search: "*boom*"})
+      |> render_submit()
+
+      assert input_value(lv, "filters_search") == "*boom*"
+    end
+
+    test "a handoff from the logs page applies the same filters", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, "/analysis?node=a@h&search=*boom*&level=error")
+
+      assert input_value(lv, "filters_search") == "*boom*"
+      assert has_element?(lv, ~s(#filters_level option[value="error"][selected]))
+      assert has_element?(lv, ~s(#analysis-active-nodes [data-node="a@h"]))
+    end
+
+    test "toggling a node keeps the search keyword", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, "/analysis?search=*x*&level=error")
+
+      render_click(lv, "toggle-node", %{"node" => "b@h"})
+
+      assert input_value(lv, "filters_search") == "*x*"
+      assert has_element?(lv, ~s(#analysis-active-nodes [data-node="b@h"]))
+    end
+  end
+
+  describe "click-to-filter" do
+    test "toggling a node adds it to the scope and keeps the other filters", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, "/analysis?node=a@h&level=error")
+
+      render_click(lv, "toggle-node", %{"node" => "b@h"})
+
+      assert has_element?(lv, ~s(#analysis-active-nodes [data-node="a@h"]))
+      assert has_element?(lv, ~s(#analysis-active-nodes [data-node="b@h"]))
+      assert has_element?(lv, ~s(#filters_level option[value="error"][selected]))
+    end
+
+    test "toggling a selected node removes it, and the last one returns to all nodes", %{
+      conn: conn
+    } do
+      {:ok, lv, _html} = live(conn, "/analysis?node=" <> URI.encode_www_form("a@h,b@h"))
+
+      render_click(lv, "toggle-node", %{"node" => "a@h"})
+
+      refute has_element?(lv, ~s(#analysis-active-nodes [data-node="a@h"]))
+      assert has_element?(lv, ~s(#analysis-active-nodes [data-node="b@h"]))
+
+      render_click(lv, "toggle-node", %{"node" => "b@h"})
+
+      assert has_element?(lv, "#analysis-active-nodes[hidden]")
+    end
+
+    test "toggling a blank node value changes nothing", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, "/analysis?node=a@h")
+
+      render_click(lv, "toggle-node", %{"node" => "  "})
+
+      assert has_element?(lv, ~s(#analysis-active-nodes [data-node="a@h"]))
+    end
+
+    test "clicking a level selects it and clicking all clears it", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/analysis")
+
+      render_click(lv, "select-level", %{"level" => "warning"})
+
+      assert has_element?(lv, ~s(#filters_level option[value="warning"][selected]))
+
+      assert has_element?(
+               lv,
+               ~s(#analysis-level-options [data-level="warning"][aria-pressed="true"])
+             )
+
+      render_click(lv, "select-level", %{"level" => "info"})
+
+      assert has_element?(lv, ~s(#filters_level option[value="info"][selected]))
+
+      render_click(lv, "select-level", %{"level" => "all"})
+
+      assert has_element?(lv, ~s(#filters_level option[value="all"][selected]))
+    end
+
+    test "clicking an unknown level is ignored", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, "/analysis?level=error")
+
+      render_click(lv, "select-level", %{"level" => "fatal"})
+
+      assert has_element?(lv, ~s(#filters_level option[value="error"][selected]))
+    end
   end
 
   defp input_value(lv, id) do

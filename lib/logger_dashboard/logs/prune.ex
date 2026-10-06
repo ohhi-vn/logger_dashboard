@@ -10,10 +10,16 @@ defmodule LoggerDashboard.Logs.Prune do
   """
 
   alias LoggerDashboard.Logs.Filter
+  alias LoggerDashboard.Logs.LogRead
 
   @doc "Parse prune params; requires explicit scope (`node` + value or `all`)."
   @unbounded_error "This prune has no datetime range. Supply a `from` or `to` to bound it."
   @multi_node_error "Pruning targets exactly one node. Supply a single node, or choose whole-system scope."
+
+  # How many of the newest matching rows a preview shows. Single-digit on
+  # purpose: enough to catch a wrong scope at a glance, small enough that a
+  # preview never becomes a second viewer page worth scanning.
+  @preview_sample_limit 5
 
   @spec parse(map()) :: {:ok, Filter.t(), :node | :all} | {:error, String.t()}
   def parse(params) when is_map(params) do
@@ -75,6 +81,28 @@ defmodule LoggerDashboard.Logs.Prune do
         if filter.level != "all", do: ["level #{filter.level}"], else: []
 
     Enum.join(parts, ", ")
+  end
+
+  @doc """
+  Describe what a confirmed prune would delete: the exact matching-row count
+  plus a bounded sample of the newest matching rows.
+
+  Reads through the same validated filter the delete executes — `parse/1`
+  already folds scope in and forces `search: ""`, so `Filter.predicates/1` here
+  emits exactly the predicates `run/2` will delete against. That is what makes
+  the number a preview states the number the delete acts on.
+
+  Returns `{:ok, %{count: non_neg_integer(), rows: [map()]}}` or
+  `{:error, term()}`. A failed read surfaces as an error rather than as a zero
+  count, because a destructive confirmation must not understate its scope.
+  """
+  @spec preview(Filter.t()) ::
+          {:ok, %{count: non_neg_integer(), rows: [map()]}} | {:error, term()}
+  def preview(%Filter{} = filter) do
+    with {:ok, count} <- LogRead.count_logs(filter),
+         {:ok, rows, _has_more} <- LogRead.list_logs(filter, limit: @preview_sample_limit) do
+      {:ok, %{count: count, rows: rows}}
+    end
   end
 
   @doc """

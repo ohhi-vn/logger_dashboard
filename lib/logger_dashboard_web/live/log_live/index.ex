@@ -23,11 +23,13 @@ defmodule LoggerDashboardWeb.LogLive.Index do
       |> assign(:filter, %Filter{})
       |> assign(:filter_error, nil)
       |> assign(:logs_error, nil)
+      |> assign(:total, nil)
       |> assign(:has_next, false)
       |> assign(:limit, Filter.default_limit())
       |> assign(:offset, 0)
       |> assign(:expanded_id, nil)
       |> assign(:page_rows, [])
+      |> assign(:node_options, [])
       |> stream_configure(:logs, dom_id: &row_dom_id/1)
       |> stream(:logs, [])
 
@@ -53,6 +55,7 @@ defmodule LoggerDashboardWeb.LogLive.Index do
           |> assign(:offset, filter.offset)
           |> assign(:limit_options, Filter.limit_options(filter.limit))
           |> load_logs(filter)
+          |> load_node_options()
 
         {:error, message} ->
           socket
@@ -60,8 +63,13 @@ defmodule LoggerDashboardWeb.LogLive.Index do
           |> assign(:form, to_form(filter_params, as: :filters))
           |> assign(:filter_error, message)
           |> assign(:logs_error, nil)
+          # A request the system rejected computed nothing, so it carries no
+          # total. Leaving the previous number up would describe a filter set
+          # that is no longer active.
+          |> assign(:total, nil)
           |> assign(:has_next, false)
           |> assign(:page_rows, [])
+          |> assign(:node_options, [])
           |> assign(:limit_options, limit_options(filter_params))
           |> stream(:logs, [], reset: true)
       end
@@ -111,6 +119,66 @@ defmodule LoggerDashboardWeb.LogLive.Index do
     # clearing nodes does not silently widen a text or time window the user set.
     params = Map.delete(socket.assigns.filter_params, "node")
     {:noreply, push_patch(socket, to: ~p"/logs?#{params}")}
+  end
+
+  @impl true
+  def handle_event("toggle-node", %{"node" => node}, socket) do
+    # Clicking a node option toggles it in or out of the comma-separated scope.
+    # Read back from the URL params rather than the parsed filter so the toggle
+    # also works while the page shows a validation error, and write back
+    # through the same `node` param so parsing stays the single validator.
+    # Other filters ride along untouched, like `clear_nodes`.
+    case String.trim(to_string(node)) do
+      "" ->
+        {:noreply, socket}
+
+      name ->
+        nodes = Filter.parse_nodes(socket.assigns.filter_params)
+
+        nodes =
+          if name in nodes,
+            do: Enum.reject(nodes, &(&1 == name)),
+            else: Enum.uniq(nodes ++ [name])
+
+        params =
+          case Filter.nodes_to_param(nodes) do
+            "" -> Map.delete(socket.assigns.filter_params, "node")
+            param -> Map.put(socket.assigns.filter_params, "node", param)
+          end
+
+        {:noreply, push_patch(socket, to: ~p"/logs?#{params}")}
+    end
+  end
+
+  @impl true
+  def handle_event("select-level", %{"level" => level}, socket) do
+    # A level click is a single-select through the same `level` param the form
+    # submits, so validation, bookmarking, and export stay unified. An unknown
+    # level is ignored here; hand-typed values still travel the form path where
+    # `Filter.parse/1` reports them.
+    level = level |> to_string() |> String.trim() |> String.downcase()
+
+    if level in Filter.levels() do
+      params = Map.put(socket.assigns.filter_params, "level", level)
+      {:noreply, push_patch(socket, to: ~p"/logs?#{params}")}
+    else
+      {:noreply, socket}
+    end
+  end
+
+  @impl true
+  def handle_event("copy-row", %{"id" => dom_id}, socket) do
+    # The copied text is the row's export line — timestamp, level, node (or its
+    # placeholder), untruncated message, location — so copy and export cannot
+    # disagree. Like export it reads the row already on the page, and like
+    # expanding it changes no state.
+    case find_row(socket.assigns.page_rows, dom_id) do
+      {:ok, _index, log} ->
+        {:noreply, push_event(socket, "logs-copy", %{body: LogLine.format(log)})}
+
+      {:error, :not_found} ->
+        {:noreply, socket}
+    end
   end
 
   @impl true
@@ -209,14 +277,49 @@ defmodule LoggerDashboardWeb.LogLive.Index do
         |> assign(:has_next, has_next)
         |> assign(:page_rows, rows)
         |> stream(:logs, rows, reset: true)
+        |> load_total(filter)
 
       {:error, error} ->
         socket
         |> assign(:logs_error, ClickHouseError.friendly(error))
+        |> assign(:total, nil)
         |> assign(:has_next, false)
         |> assign(:page_rows, [])
         |> stream(:logs, [], reset: true)
     end
+  end
+
+  # The total comes from the same parsed filter as the page rows, so it cannot
+  # describe a different filter set. A failed count leaves the total absent
+  # rather than zero: zero is a real answer, and "we could not count" is not.
+  defp load_total(socket, filter) do
+    case LogRead.count_logs(filter) do
+      {:ok, total} -> assign(socket, :total, total)
+      {:error, _error} -> assign(socket, :total, nil)
+    end
+  end
+
+  # Node options are independent of the page: they describe the table, not the
+  # rows in view, so a filtered page still offers every known node. A failed
+  # options read leaves an empty list rather than an error — the comma text
+  # input remains usable either way.
+  defp load_node_options(socket) do
+    case LogRead.list_nodes() do
+      {:ok, nodes} -> assign(socket, :node_options, nodes)
+      {:error, _error} -> assign(socket, :node_options, [])
+    end
+  end
+
+  # The viewer filters that carry over to Analysis, as URL params. Blank values
+  # are dropped so the link stays readable, and `limit`/`offset` are not sent
+  # because Analysis has no page. Built from the parsed filter so the link
+  # carries the values actually applied, including resolved preset instants.
+  defp analysis_params(%Filter{} = filter) do
+    filter
+    |> Filter.to_params()
+    |> Map.take(["node", "search", "from", "to", "preset", "level"])
+    |> Enum.reject(fn {_key, value} -> value in [nil, ""] end)
+    |> Map.new()
   end
 
   defp normalize_filter_params(%{"filters" => filters}) when is_map(filters), do: filters
@@ -278,15 +381,29 @@ defmodule LoggerDashboardWeb.LogLive.Index do
           </p>
         </div>
 
-        <button
-          type="button"
-          id="logs-clear-nodes"
-          phx-click="clear_nodes"
-          hidden={@filter.nodes == []}
-          class="btn btn-ghost btn-sm"
-        >
-          <.icon name="hero-x-mark" class="size-4" /> Clear nodes
-        </button>
+        <div class="flex items-center gap-2">
+          <%!-- Carries the active filters into Analysis so an investigation can
+                continue there without retyping them. A GET link built from the
+                parsed filter, so it is bookmarkable and back-button safe. --%>
+          <.link
+            id="logs-analyze"
+            navigate={~p"/analysis?#{analysis_params(@filter)}"}
+            title="Run analysis on these filters"
+            class="btn btn-ghost btn-sm"
+          >
+            <.icon name="hero-chart-bar" class="size-4" /> Analyze these filters
+          </.link>
+
+          <button
+            type="button"
+            id="logs-clear-nodes"
+            phx-click="clear_nodes"
+            hidden={@filter.nodes == []}
+            class="btn btn-ghost btn-sm"
+          >
+            <.icon name="hero-x-mark" class="size-4" /> Clear nodes
+          </button>
+        </div>
       </div>
 
       <div
@@ -302,6 +419,63 @@ defmodule LoggerDashboardWeb.LogLive.Index do
         >
           {node}
         </span>
+      </div>
+
+      <%!-- Clickable node options, sourced from the table rather than the page,
+            so every known node is offered even when the page shows a subset.
+            A click toggles the node through the same `node` param as the text
+            input, which stays as the fallback for unknown or off-list names. --%>
+      <div id="logs-node-options" class="flex flex-wrap items-center gap-2 text-sm">
+        <span class="text-base-content/70">All nodes:</span>
+        <button
+          :for={node <- @node_options}
+          type="button"
+          id={"logs-node-#{Base.url_encode64(node, padding: false)}"}
+          phx-click="toggle-node"
+          phx-value-node={node}
+          data-node={node}
+          aria-pressed={to_string(node in @filter.nodes)}
+          title={
+            if node in @filter.nodes, do: "Remove #{node} from scope", else: "Add #{node} to scope"
+          }
+          class={[
+            "badge cursor-pointer border",
+            node in @filter.nodes && "badge-primary",
+            node not in @filter.nodes && "badge-outline badge-ghost hover:badge-primary"
+          ]}
+        >
+          {node}
+        </button>
+        <span :if={@node_options == []} class="text-xs text-base-content/50">
+          No known nodes — type one below.
+        </span>
+      </div>
+
+      <%!-- Clickable single-select levels through the same `level` param the
+            form submits, so validation and bookmarks stay unified. --%>
+      <div
+        id="logs-level-options"
+        class="flex flex-wrap items-center gap-2 text-sm"
+        role="group"
+        aria-label="Level filter"
+      >
+        <span class="text-base-content/70">Level:</span>
+        <button
+          :for={level <- Filter.levels()}
+          type="button"
+          id={"logs-level-#{level}"}
+          phx-click="select-level"
+          phx-value-level={level}
+          data-level={level}
+          aria-pressed={to_string(@filter.level == level)}
+          class={[
+            "badge cursor-pointer border uppercase",
+            @filter.level == level && "badge-primary",
+            @filter.level != level && "badge-outline badge-ghost hover:badge-primary"
+          ]}
+        >
+          {level}
+        </button>
       </div>
 
       <.form
@@ -352,101 +526,177 @@ defmodule LoggerDashboardWeb.LogLive.Index do
       <% end %>
 
       <%!-- A continuous list of lines rather than separated cards: no gap between
-            rows, no per-row box, and a single hairline between neighbours. The
-            row is a flex line that wraps, so an expanded panel can take the full
-            width on its own line underneath. --%>
-      <div id="logs-list" phx-update="stream">
-        <div class="hidden only:block" id="logs-empty">
-          <p class="px-2 py-1 text-sm text-base-content/70">
-            No logs match the current scope and filters.
-          </p>
-        </div>
-        <article
-          :for={{dom_id, log} <- @streams.logs}
-          id={dom_id}
-          data-role="log-line"
-          data-level={to_string(log.level)}
-          data-node={log.node}
-          class={[
-            "flex flex-wrap items-center gap-x-2 border-b border-l-4 border-base-300 py-0.5 pr-1 pl-2 font-mono text-xs leading-5 transition-colors hover:bg-base-200/40",
-            level_accent(log.level)
-          ]}
+            rows, no per-row box, and a single hairline between neighbours. Rows
+            share one explicit column layout with the header (see `.logs-grid`
+            in app.css), so timestamp, level, node, message, source, and actions
+            line up down the page. Column widths are CSS variables on
+            `#logs-table` tuned by the header's resize handles, never by the
+            server, so re-streamed rows inherit them untouched. The expanded
+            panel spans the full row underneath its line. --%>
+      <div id="logs-table">
+        <div
+          id="logs-header"
+          role="row"
+          class="logs-grid gap-x-2 border-b border-base-300 py-0.5 pr-1 pl-2 font-mono text-xs font-semibold tracking-wide text-base-content/60 uppercase"
         >
-          <%!-- Field order is `LogLine.fields/2`'s: UTC timestamp, level, node,
+          <div class="relative truncate" data-role="log-column" data-column="timestamp">
+            Timestamp
+            <span
+              data-resize="ts"
+              title="Resize timestamp column"
+              class="absolute top-0 right-0 h-full w-2 cursor-col-resize"
+            />
+          </div>
+          <div class="relative truncate" data-role="log-column" data-column="level">
+            Level
+            <span
+              data-resize="level"
+              title="Resize level column"
+              class="absolute top-0 right-0 h-full w-2 cursor-col-resize"
+            />
+          </div>
+          <div class="relative truncate" data-role="log-column" data-column="node">
+            Node
+            <span
+              data-resize="node"
+              title="Resize node column"
+              class="absolute top-0 right-0 h-full w-2 cursor-col-resize"
+            />
+          </div>
+          <div class="truncate" data-role="log-column" data-column="message">Message</div>
+          <div class="relative truncate" data-role="log-column" data-column="source">
+            Source
+            <span
+              data-resize="source"
+              title="Resize source column"
+              class="absolute top-0 right-0 h-full w-2 cursor-col-resize"
+            />
+          </div>
+          <div class="truncate" data-role="log-column" data-column="actions">Actions</div>
+        </div>
+        <div id="logs-list" phx-update="stream">
+          <div class="hidden only:block" id="logs-empty">
+            <p class="px-2 py-1 text-sm text-base-content/70">
+              No logs match the current scope and filters.
+            </p>
+          </div>
+          <article
+            :for={{dom_id, log} <- @streams.logs}
+            id={dom_id}
+            data-role="log-line"
+            data-level={to_string(log.level)}
+            data-node={log.node}
+            class={[
+              "logs-grid items-center gap-x-2 border-b border-l-4 border-base-300 py-0.5 pr-1 pl-2 font-mono text-xs leading-5 transition-colors hover:bg-base-200/40",
+              level_accent(log.level)
+            ]}
+          >
+            <%!-- Field order is `LogLine.fields/2`'s: UTC timestamp, level, node,
                 message, source location. Each gets its own element because they
                 carry different treatment and different truncation budgets. --%>
-          <span class="shrink-0 text-base-content/50" data-role="log-timestamp">
-            {LogLine.timestamp(log)}
-          </span>
+            <span class="truncate text-base-content/50" data-role="log-timestamp">
+              {LogLine.timestamp(log)}
+            </span>
 
-          <%!-- Level is both the row's left accent and a badge carrying it as
+            <%!-- Level is both the row's left accent and a badge carrying it as
                 text, so it is never conveyed by colour alone. --%>
-          <span
-            class={["badge badge-xs shrink-0 font-medium uppercase", level_badge(log.level)]}
-            data-role="log-level"
-          >
-            {LogLine.level(log)}
-          </span>
+            <span
+              class={["badge badge-xs font-medium uppercase", level_badge(log.level)]}
+              data-role="log-level"
+            >
+              {LogLine.level(log)}
+            </span>
 
-          <span class="w-36 shrink-0 truncate text-base-content/70" data-role="log-node">
-            {LogLine.node_name(log)}
-          </span>
+            <span class="truncate text-base-content/70" data-role="log-node">
+              {LogLine.node_name(log)}
+            </span>
 
-          <%!-- `min-w-0` is what lets a flex child shrink below its content, so
-                the ellipsis engages instead of the row growing wider or the
-                message wrapping onto a second line. --%>
-          <span
-            class="min-w-0 flex-1 truncate"
-            data-role="log-message"
-            title={LogLine.message(log)}
-          >
-            {LogLine.message(log, shorten: true)}
-          </span>
+            <%!-- `min-w-0` is what lets the grid child shrink below its content, so
+                the ellipsis engages instead of the message pushing the row wider
+                or wrapping onto a second line. --%>
+            <span
+              class="min-w-0 truncate"
+              data-role="log-message"
+              title={LogLine.message(log)}
+            >
+              {LogLine.message(log, shorten: true)}
+            </span>
 
-          <span
-            :if={LogLine.location(log)}
-            class="w-64 shrink-0 truncate text-base-content/50"
-            data-role="log-source"
-          >
-            {LogLine.location(log)}
-          </span>
+            <span
+              :if={LogLine.location(log)}
+              class="truncate text-base-content/50"
+              data-role="log-source"
+            >
+              {LogLine.location(log)}
+            </span>
+            <span
+              :if={!LogLine.location(log)}
+              class="truncate text-base-content/30"
+              data-role="log-source"
+            >
+              —
+            </span>
 
-          <button
-            type="button"
-            id={"logs-expand-#{dom_id}"}
-            phx-click="toggle-expand"
-            phx-value-id={dom_id}
-            aria-expanded={to_string(@expanded_id == dom_id)}
-            aria-controls={@expanded_id == dom_id && "logs-expanded-#{dom_id}"}
-            aria-label={"Expand #{LogLine.timestamp(log)}"}
-            class="btn btn-ghost btn-xs shrink-0 px-1 text-base-content/50"
-          >
-            <.icon
-              name="hero-chevron-down"
-              class={["size-3.5 transition-transform", @expanded_id == dom_id && "rotate-180"]}
-            />
-          </button>
+            <span class="flex shrink-0 items-center gap-0.5">
+              <%!-- Copies the row's export line — timestamp, level, node,
+                  untruncated message, location — so copy and export agree. --%>
+              <button
+                type="button"
+                id={"logs-copy-#{dom_id}"}
+                phx-click="copy-row"
+                phx-value-id={dom_id}
+                data-role="log-copy"
+                aria-label={"Copy #{LogLine.timestamp(log)}"}
+                title={LogLine.format(log)}
+                class="btn btn-ghost btn-xs shrink-0 px-1 text-base-content/50"
+              >
+                <.icon name="hero-clipboard" class="size-3.5" />
+              </button>
 
-          <div
-            :if={@expanded_id == dom_id}
-            id={"logs-expanded-#{dom_id}"}
-            class="w-full basis-full border-t border-dashed border-base-300 bg-base-200/40 py-1.5"
-          >
-            <pre
-              class="font-mono text-xs break-words whitespace-pre-wrap"
-              data-role="log-full-message"
-            >{LogLine.message(log)}</pre>
+              <button
+                type="button"
+                id={"logs-expand-#{dom_id}"}
+                phx-click="toggle-expand"
+                phx-value-id={dom_id}
+                aria-expanded={to_string(@expanded_id == dom_id)}
+                aria-controls={@expanded_id == dom_id && "logs-expanded-#{dom_id}"}
+                aria-label={"Expand #{LogLine.timestamp(log)}"}
+                class="btn btn-ghost btn-xs shrink-0 px-1 text-base-content/50"
+              >
+                <.icon
+                  name="hero-chevron-down"
+                  class={["size-3.5 transition-transform", @expanded_id == dom_id && "rotate-180"]}
+                />
+              </button>
+            </span>
 
-            <div :if={LogLine.metadata?(log)} class="mt-1" data-role="log-metadata">
-              <p class="text-xs font-medium text-base-content/60">metadata</p>
-              <pre class="mt-0.5 overflow-x-auto font-mono text-xs whitespace-pre-wrap">{meta_lines(log.metadata)}</pre>
+            <div
+              :if={@expanded_id == dom_id}
+              id={"logs-expanded-#{dom_id}"}
+              class="col-span-full border-t border-dashed border-base-300 bg-base-200/40 py-1.5"
+            >
+              <pre
+                class="font-mono text-xs break-words whitespace-pre-wrap"
+                data-role="log-full-message"
+              >{LogLine.message(log)}</pre>
+
+              <div :if={LogLine.metadata?(log)} class="mt-1" data-role="log-metadata">
+                <p class="text-xs font-medium text-base-content/60">metadata</p>
+                <pre class="mt-0.5 overflow-x-auto font-mono text-xs whitespace-pre-wrap">{meta_lines(log.metadata)}</pre>
+              </div>
             </div>
-          </div>
-        </article>
+          </article>
+        </div>
       </div>
 
       <div id="logs-pagination" class="flex flex-wrap items-center gap-3">
         <.button id="logs-prev" phx-click="prev" disabled={@offset == 0}>Previous</.button>
+        <%!-- The count for the whole filtered result, not just this page.
+              Absent when the request was rejected or the count failed, so a
+              number is never shown for a filter set it does not describe. --%>
+        <span :if={is_integer(@total)} id="logs-total" class="text-sm text-base-content/70">
+          Total {@total}
+        </span>
         <%!-- Reads the resolved offset and limit rather than naming page sizes,
               so it stays true when a link carries a size the control no longer
               offers. --%>

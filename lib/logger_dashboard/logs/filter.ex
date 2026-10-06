@@ -322,6 +322,16 @@ defmodule LoggerDashboard.Logs.Filter do
   def default_limit, do: @default_limit
 
   @doc """
+  The level vocabulary the viewer's level control offers.
+
+  Owned here so the offered values have one source: the template renders this
+  list rather than restating it, and the values cannot drift from the ones
+  `parse/1` validates.
+  """
+  @spec levels() :: [String.t()]
+  def levels, do: @levels
+
+  @doc """
   The page sizes the viewer's per-page control offers, as strings.
 
   Owned here so the offered values have one source: the template renders this

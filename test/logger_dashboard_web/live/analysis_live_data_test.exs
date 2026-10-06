@@ -208,6 +208,30 @@ defmodule LoggerDashboardWeb.AnalysisLiveDataTest do
     end
   end
 
+  describe "keyword" do
+    test "narrows every breakdown to the keyword scope", %{conn: conn, node: node} do
+      {:ok, lv, _html} = live(conn, "/analysis?node=#{node}&search=*rich%20error*")
+
+      assert rendered_rows(lv, "#analysis-levels") == [{"error", [{"level", "2"}]}]
+      assert rendered_rows(lv, "#analysis-nodes") == [{node, [{"node", "2"}]}]
+    end
+
+    test "a keyword scope matching no rows renders empty tables", %{conn: conn, empty: empty} do
+      {:ok, lv, _html} = live(conn, "/analysis?node=#{empty}&search=*rich*")
+
+      refute has_element?(lv, "#analysis-levels tbody tr")
+      refute has_element?(lv, "#analysis-volume tbody tr")
+      refute has_element?(lv, "#analysis-nodes tbody tr")
+    end
+
+    test "keeps the limit disclosure with a keyword active", %{conn: conn, node: node} do
+      {:ok, lv, _html} = live(conn, "/analysis?node=#{node}&search=*rich*")
+
+      applied = Analysis.applied_limit(limit: 1_000)
+      assert lv |> element("#analysis-limit") |> render() =~ to_string(applied)
+    end
+  end
+
   describe "limit disclosure" do
     test "reports the applied limit after a query runs", %{conn: conn, node: node} do
       {:ok, lv, _html} = live(conn, "/analysis?node=#{node}")
@@ -217,6 +241,44 @@ defmodule LoggerDashboardWeb.AnalysisLiveDataTest do
 
       assert lv |> element("#analysis-limit") |> render() =~ to_string(applied)
       assert applied == min(1_000, max)
+    end
+  end
+
+  describe "node options" do
+    test "offers known nodes independent of the current scope", %{
+      conn: conn,
+      node: node,
+      quieter: quieter
+    } do
+      # The page itself matches nothing, yet the options still list the table's
+      # nodes rather than the page's scope.
+      {:ok, lv, _html} =
+        live(conn, "/analysis?node=no-such-node-#{System.unique_integer([:positive])}")
+
+      assert has_element?(lv, ~s(#analysis-node-options [data-node="#{node}"]))
+      assert has_element?(lv, ~s(#analysis-node-options [data-node="#{quieter}"]))
+    end
+
+    test "clicking a node option toggles it through the URL scope", %{conn: conn, node: node} do
+      {:ok, lv, _html} = live(conn, ~p"/analysis")
+
+      assert has_element?(
+               lv,
+               ~s(#analysis-node-options [data-node="#{node}"][aria-pressed="false"])
+             )
+
+      lv |> element(~s(#analysis-node-options [data-node="#{node}"])) |> render_click()
+
+      assert has_element?(
+               lv,
+               ~s(#analysis-node-options [data-node="#{node}"][aria-pressed="true"])
+             )
+
+      assert has_element?(lv, ~s(#analysis-active-nodes [data-node="#{node}"]))
+
+      lv |> element(~s(#analysis-node-options [data-node="#{node}"])) |> render_click()
+
+      assert has_element?(lv, "#analysis-active-nodes[hidden]")
     end
   end
 

@@ -102,4 +102,33 @@
 /* Make LiveView wrapper divs transparent for layout */
 [data-phx-session], [data-phx-teleported-src] { display: contents }
 
+/* Log viewer table: one explicit column layout shared by the header and every
+   row, so timestamp, level, node, message, source, and actions line up down
+   the page. Widths are CSS variables on `#logs-table`, tuned in the browser by
+   the header's resize handles and never sent to the server, so re-streamed
+   rows inherit them untouched. The message column flexes; the rest are fixed. */
+#logs-table {
+  --logs-col-ts: 11.5rem;
+  --logs-col-level: 4.5rem;
+  --logs-col-node: 9rem;
+  --logs-col-source: 16rem;
+  overflow-x: auto;
+}
+
+.logs-grid {
+  display: grid;
+  min-width: 56rem;
+  grid-template-columns:
+    var(--logs-col-ts)
+    var(--logs-col-level)
+    var(--logs-col-node)
+    minmax(0, 1fr)
+    var(--logs-col-source)
+    auto;
+}
+
+#logs-table [data-resize]:hover {
+  background-color: color-mix(in oklab, currentColor 25%, transparent);
+}
+
 /* This file is for your main application CSS */

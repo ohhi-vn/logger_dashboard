@@ -180,6 +180,58 @@ defmodule LoggerDashboard.Logs.AnalysisTest do
     assert "unknown" in result.labels
   end
 
+  describe "keyword-filtered analysis" do
+    test "level_frequency narrows by keyword, dominant level first", %{node: node} do
+      # `*o*` matches all three scoped rows; the keyword path must still order
+      # by count descending (error=2, info=1), not alphabetically.
+      assert {:ok, filter} = Filter.parse(%{"node" => node, "search" => "*o*"})
+      assert {:ok, result} = Analysis.level_frequency(filter, limit: 100)
+
+      assert result.labels == ["error", "info"]
+      assert hd(result.series).data == [2, 1]
+    end
+
+    test "node_frequency narrows by keyword", %{node: node} do
+      assert {:ok, filter} = Filter.parse(%{"node" => node, "search" => "*boom*"})
+      assert {:ok, result} = Analysis.node_frequency(filter, limit: 100)
+
+      assert result.labels == [node]
+      assert hd(result.series).data == [2]
+    end
+
+    test "volume_over_time narrows by keyword", %{node: node} do
+      assert {:ok, filter} = Filter.parse(%{"node" => node, "search" => "*boom*"})
+      assert {:ok, result} = Analysis.volume_over_time(filter, :hour, limit: 100)
+
+      assert result.type == :time_bucket
+      assert Enum.sum(hd(result.series).data) == 2
+    end
+
+    test "keyword volume splits into one aligned series per level", %{node: node} do
+      assert {:ok, filter} = Filter.parse(%{"node" => node, "search" => "*o*"})
+
+      assert {:ok, result} =
+               Analysis.volume_over_time(filter, :hour, limit: 100, split_by_level: true)
+
+      assert Enum.sort(Enum.map(result.series, & &1.name)) == ["error", "info"]
+
+      # Every series is aligned to the shared bucket axis, so each has one value
+      # per label — no level's count is dropped or misattributed.
+      for series <- result.series do
+        assert length(series.data) == length(result.labels)
+      end
+    end
+
+    test "a keyword scope matching nothing renders empty results", %{node: node} do
+      assert {:ok, filter} =
+               Filter.parse(%{"node" => node, "search" => "*no such text at all*"})
+
+      assert {:ok, %{labels: []}} = Analysis.level_frequency(filter, limit: 100)
+      assert {:ok, %{labels: []}} = Analysis.volume_over_time(filter, :hour, limit: 100)
+      assert {:ok, %{labels: []}} = Analysis.node_frequency(filter, limit: 100)
+    end
+  end
+
   test "dyan_filters excludes message search" do
     assert {:ok, filter} =
              Filter.parse(%{"node" => "a@b", "search" => "*boom*", "level" => "error"})

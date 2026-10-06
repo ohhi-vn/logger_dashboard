@@ -265,6 +265,90 @@ defmodule LoggerDashboard.Logs.LogReadTest do
     end
   end
 
+  describe "count_logs/1" do
+    setup do
+      tag = "count-#{System.system_time(:millisecond)}-#{:rand.uniform(1_000_000)}@host"
+      on_exit(fn -> delete_tag(tag) end)
+      %{tag: tag}
+    end
+
+    test "counts every matching row, not just one page", %{tag: tag} do
+      for i <- 1..5 do
+        seed(
+          tag,
+          "count row #{i}",
+          :info,
+          DateTime.add(~U[2026-01-01 00:00:00.000000Z], i, :minute)
+        )
+      end
+
+      assert {:ok, 5} = LogRead.count_logs(%Filter{nodes: [tag]})
+    end
+
+    test "applies level and range predicates", %{tag: tag} do
+      seed(tag, "old error", :error, ~U[2026-01-01 00:00:00.000000Z])
+      seed(tag, "new error", :error, ~U[2026-06-01 00:00:00.000000Z])
+      seed(tag, "new info", :info, ~U[2026-06-01 00:00:00.000000Z])
+
+      assert {:ok, 2} = LogRead.count_logs(%Filter{nodes: [tag], level: "error"})
+
+      assert {:ok, 2} =
+               LogRead.count_logs(%Filter{nodes: [tag], from: ~U[2026-03-01 00:00:00.000000Z]})
+    end
+
+    test "counts the search pattern against the whole scope", %{tag: tag} do
+      seed(tag, "needle one", :info, ~U[2026-01-01 00:00:00.000000Z])
+      seed(tag, "needle two", :info, ~U[2026-01-02 00:00:00.000000Z])
+      seed(tag, "haystack", :info, ~U[2026-01-03 00:00:00.000000Z])
+
+      assert {:ok, 2} = LogRead.count_logs(%Filter{nodes: [tag], search: "*needle*"})
+    end
+
+    test "counts zero when nothing matches", %{tag: tag} do
+      assert {:ok, 0} = LogRead.count_logs(%Filter{nodes: ["no-such-node-#{tag}"]})
+    end
+
+    test "treats a nil rows field as an error, not a zero count" do
+      # An unsupported `default_format` yields `%Result{rows: nil}` with no
+      # raise. Reading that as zero would show "Total 0" over a node that has
+      # rows, so it must surface as a failure.
+      assert {:error, message} = LogRead.count_result({:ok, %{rows: nil, columns: nil}})
+      assert message =~ "unrecognized response format"
+
+      assert {:ok, 7} = LogRead.count_result({:ok, %{rows: [[7]]}})
+    end
+  end
+
+  describe "list_nodes/1" do
+    test "returns distinct ordered nodes and excludes null and empty" do
+      stamp = System.system_time(:millisecond)
+      first = "nodes-a-#{stamp}@host"
+      second = "nodes-b-#{stamp}@host"
+      base = ~U[2026-01-01 00:00:00.000000Z]
+
+      seed(first, "nodes first", :info, base)
+      seed(first, "nodes first again", :info, DateTime.add(base, 1, :minute))
+      seed(second, "nodes second", :info, base)
+      seed(nil, "nodes without node", :info, base)
+
+      on_exit(fn ->
+        ClickhouseExLogger.Repo.query("DELETE FROM logs WHERE node = ?", [first])
+        ClickhouseExLogger.Repo.query("DELETE FROM logs WHERE node = ?", [second])
+      end)
+
+      # Async inserts plus a shared instance: poll until our nodes are visible
+      # rather than assuming the first read sees them.
+      await_nodes([first, second])
+
+      assert {:ok, nodes} = LogRead.list_nodes(1000)
+      assert first in nodes
+      assert second in nodes
+      assert nodes == Enum.sort(nodes)
+      refute "" in nodes
+      refute nil in nodes
+    end
+  end
+
   defp seed(tag, message, level, timestamp) do
     row = %{
       id: Ash.UUID.generate(),
@@ -284,5 +368,28 @@ defmodule LoggerDashboard.Logs.LogReadTest do
 
   defp delete_tag(tag) do
     ClickhouseExLogger.Repo.query("DELETE FROM logs WHERE node = ?", [tag])
+  end
+
+  # `ClickhouseExLogger.Insert` writes with async insert, so a node accepted by
+  # the driver is not immediately visible to a distinct-nodes read. Polling
+  # keeps the assertion on real query results instead of a fixed sleep.
+  defp await_nodes(expected, attempts \\ 20) do
+    visible? =
+      case LogRead.list_nodes(1000) do
+        {:ok, nodes} -> Enum.all?(expected, &(&1 in nodes))
+        {:error, _} -> false
+      end
+
+    cond do
+      visible? ->
+        :ok
+
+      attempts == 0 ->
+        flunk("nodes #{inspect(expected)} never became visible")
+
+      true ->
+        Process.sleep(250)
+        await_nodes(expected, attempts - 1)
+    end
   end
 end

@@ -86,6 +86,70 @@ defmodule LoggerDashboard.Logs.PruneTest do
     refute sql =~ "message"
   end
 
+  describe "preview/1" do
+    setup do
+      uniq = "#{System.system_time(:millisecond)}-#{:rand.uniform(1_000_000)}"
+      node = "prune-preview-#{uniq}@host"
+      now = DateTime.truncate(DateTime.utc_now(), :microsecond)
+
+      on_exit(fn -> ClickhouseExLogger.Repo.query("DELETE FROM logs WHERE node = ?", [node]) end)
+
+      %{node: node, now: now}
+    end
+
+    test "counts the scope and returns its newest sample", %{node: node, now: now} do
+      insert_rows(node, now, ["preview newest", "preview middle", "preview oldest"])
+
+      assert {:ok, filter, :node} =
+               Prune.parse(%{
+                 "scope" => "node",
+                 "node" => node,
+                 "from" => DateTime.to_iso8601(DateTime.add(now, -60, :minute))
+               })
+
+      assert {:ok, %{count: 3, rows: sample}} = Prune.preview(filter)
+
+      assert Enum.map(sample, & &1.message) == [
+               "preview newest",
+               "preview middle",
+               "preview oldest"
+             ]
+    end
+
+    test "caps the sample while reporting the full count", %{node: node, now: now} do
+      insert_rows(node, now, Enum.map(1..7, &"preview row #{&1}"))
+
+      assert {:ok, filter, :node} =
+               Prune.parse(%{
+                 "scope" => "node",
+                 "node" => node,
+                 "from" => DateTime.to_iso8601(DateTime.add(now, -60, :minute))
+               })
+
+      assert {:ok, %{count: 7, rows: sample}} = Prune.preview(filter)
+      assert length(sample) == 5
+
+      assert Enum.map(sample, & &1.message) == [
+               "preview row 1",
+               "preview row 2",
+               "preview row 3",
+               "preview row 4",
+               "preview row 5"
+             ]
+    end
+
+    test "reports a zero count and no rows for an empty scope", %{node: node} do
+      assert {:ok, filter, :node} =
+               Prune.parse(%{
+                 "scope" => "node",
+                 "node" => node,
+                 "from" => "2000-01-01T00:00:00Z"
+               })
+
+      assert {:ok, %{count: 0, rows: []}} = Prune.preview(filter)
+    end
+  end
+
   test "run deletes only scoped rows" do
     uniq = "#{System.system_time(:millisecond)}-#{:rand.uniform(1_000_000)}"
     keep = "prune-keep-#{uniq}@host"
@@ -134,6 +198,29 @@ defmodule LoggerDashboard.Logs.PruneTest do
 
     assert eventually(fn -> count_rows(del) == 0 end, 30_000)
     assert count_rows(keep) == 1
+  end
+
+  defp insert_rows(node, now, messages) do
+    rows =
+      messages
+      |> Enum.with_index(1)
+      |> Enum.map(fn {message, minutes_ago} ->
+        %{
+          id: Ash.UUID.generate(),
+          timestamp: DateTime.add(now, -minutes_ago, :minute),
+          level: "info",
+          message: message,
+          module: "Test",
+          file: nil,
+          line: nil,
+          function: nil,
+          metadata: %{},
+          node: node
+        }
+      end)
+
+    assert {:ok, _} = ClickhouseExLogger.Insert.insert(rows)
+    Process.sleep(2_000)
   end
 
   defp count_rows(node) do
