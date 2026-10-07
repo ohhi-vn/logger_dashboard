@@ -139,6 +139,19 @@ defmodule LoggerDashboardWeb.AnalysisLiveDataTest do
       assert [{"error", [{"level", "2"}]}, {"info", [{"level", "1"}]}] =
                rendered_rows(lv, "#analysis-levels")
     end
+
+    test "a multi-level scope aggregates either level", %{conn: conn, node: node} do
+      {:ok, lv, _html} = live(conn, "/analysis?node=#{node}&level=error,info")
+
+      assert [{"error", [{"level", "2"}]}, {"info", [{"level", "1"}]}] =
+               rendered_rows(lv, "#analysis-levels")
+    end
+
+    test "a single-level scope narrows the breakdown", %{conn: conn, node: node} do
+      {:ok, lv, _html} = live(conn, "/analysis?node=#{node}&level=info")
+
+      assert [{"info", [{"level", "1"}]}] = rendered_rows(lv, "#analysis-levels")
+    end
   end
 
   describe "by node" do
@@ -183,7 +196,7 @@ defmodule LoggerDashboardWeb.AnalysisLiveDataTest do
       {:ok, lv, _html} = live(conn, "/analysis?node=#{node}&bucket=day")
 
       lv
-      |> form("#analysis-filter-form", filters: %{level: "error"})
+      |> form("#analysis-filter-form", filters: %{search: "*rich*"})
       |> render_submit()
 
       assert has_element?(lv, "#filters_bucket option[value=day][selected]")

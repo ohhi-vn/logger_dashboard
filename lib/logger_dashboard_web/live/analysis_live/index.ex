@@ -16,6 +16,7 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
       |> assign(:page_title, "Analysis")
       |> assign(:filter_params, %{})
       |> assign(:nodes_selected, [])
+      |> assign(:levels_selected, [])
       |> assign(:node_options, [])
       |> assign(:form, to_form(%{}, as: :filters))
       |> assign(:levels, nil)
@@ -33,6 +34,7 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
   def handle_params(params, _uri, socket) do
     filter_params = Map.take(params, @filter_keys)
     nodes_selected = selected_nodes(filter_params)
+    levels_selected = selected_levels(filter_params)
 
     # Normalized once, up front, so the query and the control that displays the
     # bucket are derived from the same value. `Filter.to_params/1` has no
@@ -46,6 +48,7 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
       socket
       |> assign(:filter_params, filter_params)
       |> assign(:nodes_selected, nodes_selected)
+      |> assign(:levels_selected, levels_selected)
 
     socket =
       case Filter.parse(Map.put(filter_params, "limit", "50")) do
@@ -135,16 +138,36 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
 
   @impl true
   def handle_event("select-level", %{"level" => level}, socket) do
-    # Single-select through the same `level` param the form submits. An unknown
-    # level is ignored here; hand-typed values travel the form path where
-    # `Filter.parse/1` reports them.
+    # Toggle through the same `level` param the form submits, mirroring the
+    # Logs page: read the set back from the URL params so the toggle works
+    # while a validation error is shown. An unknown level is ignored here;
+    # hand-typed values travel the form path where `Filter.parse/1` reports
+    # them.
     level = level |> to_string() |> String.trim() |> String.downcase()
 
-    if level in Filter.levels() do
-      params = Map.put(socket.assigns.filter_params, "level", level)
-      {:noreply, push_patch(socket, to: ~p"/analysis?#{params}")}
-    else
-      {:noreply, socket}
+    cond do
+      level == "all" ->
+        params = Map.delete(socket.assigns.filter_params, "level")
+        {:noreply, push_patch(socket, to: ~p"/analysis?#{params}")}
+
+      level in Filter.level_values() ->
+        levels = selected_levels(socket.assigns.filter_params)
+
+        levels =
+          if level in levels,
+            do: Enum.reject(levels, &(&1 == level)),
+            else: levels ++ [level]
+
+        params =
+          case Filter.levels_to_param(levels) do
+            "" -> Map.delete(socket.assigns.filter_params, "level")
+            param -> Map.put(socket.assigns.filter_params, "level", param)
+          end
+
+        {:noreply, push_patch(socket, to: ~p"/analysis?#{params}")}
+
+      true ->
+        {:noreply, socket}
     end
   end
 
@@ -162,12 +185,23 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
   # the same request failed validation and left the query unparsed.
   defp selected_nodes(filter_params), do: Filter.parse_nodes(filter_params)
 
+  # Same treatment for the level set: the badges reflect the URL params, not
+  # the parsed filter, so they stay correct on the rejected-filter path.
+  defp selected_levels(filter_params) do
+    case Filter.parse_levels(filter_params) do
+      {:ok, levels} -> levels
+      {:error, _} -> []
+    end
+  end
+
   # The form is built from the parsed filter so the inputs show what was
-  # applied, with this page's own `bucket` added on top. `Filter.to_params/1`
-  # deliberately knows nothing about buckets — they are a presentation choice
-  # this page owns — so omitting the merge here is what left the select blank.
+  # applied, with this page's own `bucket` added on top.
+  # `Filter.to_params/1` deliberately knows nothing about buckets — they are
+  # a presentation choice this page owns.
   defp form_params(filter, bucket) do
-    Map.put(Filter.to_params(filter), "bucket", Atom.to_string(bucket))
+    filter
+    |> Filter.to_params()
+    |> Map.put("bucket", Atom.to_string(bucket))
   end
 
   # An AshDyan result for a scope with no matching rows carries an empty series,
@@ -354,34 +388,6 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
         </span>
       </div>
 
-      <%!-- Clickable single-select levels through the same `level` param the
-            form submits, so validation and bookmarks stay unified. --%>
-      <div
-        id="analysis-level-options"
-        class="flex flex-wrap items-center gap-2 text-sm"
-        role="group"
-        aria-label="Level filter"
-      >
-        <span class="text-base-content/70">Level:</span>
-        <button
-          :for={level <- Filter.levels()}
-          type="button"
-          id={"analysis-level-#{level}"}
-          phx-click="select-level"
-          phx-value-level={level}
-          data-level={level}
-          aria-pressed={to_string(Map.get(@filter_params, "level", "all") == level)}
-          class={[
-            "badge cursor-pointer border uppercase",
-            Map.get(@filter_params, "level", "all") == level && "badge-primary",
-            Map.get(@filter_params, "level", "all") != level &&
-              "badge-outline badge-ghost hover:badge-primary"
-          ]}
-        >
-          {level}
-        </button>
-      </div>
-
       <.form
         for={@form}
         id="analysis-filter-form"
@@ -404,13 +410,37 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
         </div>
         <.bound id="analysis" bound={:from} field={@form[:from]} label="From (UTC)" />
         <.bound id="analysis" bound={:to} field={@form[:to]} label="To (UTC)" />
-        <.input
-          field={@form[:level]}
-          label="Level"
-          type="select"
-          options={["all", "error", "warning", "info", "debug"]}
-        />
-        <.input field={@form[:bucket]} label="Bucket" type="select" options={["hour", "day"]} />
+        <%!-- Single level selector: toggle badges through the `level` URL param.
+              Full-width row so wrapping grows the card instead of overlapping
+              neighbouring inputs. An empty set (or `all`) applies no predicate. --%>
+        <div
+          id="analysis-level-options"
+          class="flex flex-wrap items-center gap-2 text-sm md:col-span-6"
+          role="group"
+          aria-label="Level filter"
+        >
+          <span class="text-base-content/70">Level:</span>
+          <button
+            :for={level <- Filter.levels()}
+            type="button"
+            id={"analysis-level-#{level}"}
+            phx-click="select-level"
+            phx-value-level={level}
+            data-level={level}
+            aria-pressed={to_string(Filter.level_active?(@levels_selected, level))}
+            class={[
+              "badge cursor-pointer border uppercase",
+              Filter.level_active?(@levels_selected, level) && "badge-primary",
+              !Filter.level_active?(@levels_selected, level) &&
+                "badge-outline badge-ghost hover:badge-primary"
+            ]}
+          >
+            {level}
+          </button>
+        </div>
+        <div class="md:col-span-2">
+          <.input field={@form[:bucket]} label="Bucket" type="select" options={["hour", "day"]} />
+        </div>
         <div class="md:col-span-6 flex flex-wrap items-center justify-between gap-2">
           <div class="flex gap-2">
             <.button>Run analysis</.button>
@@ -441,7 +471,7 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
 
       <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
         <div class="rounded-xl border border-base-300 bg-base-100 p-4">
-          <h2 class="font-semibold">By level</h2>
+          <h2 class="text-lg font-semibold tracking-tight">By level</h2>
           <canvas
             id="analysis-chart-level"
             data-chart={if @charts[:level], do: Jason.encode!(@charts[:level]), else: "{}"}
@@ -452,7 +482,7 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
         </div>
 
         <div class="rounded-xl border border-base-300 bg-base-100 p-4">
-          <h2 class="font-semibold">Volume over time</h2>
+          <h2 class="text-lg font-semibold tracking-tight">Volume over time</h2>
           <canvas
             id="analysis-chart-volume"
             data-chart={if @charts[:volume], do: Jason.encode!(@charts[:volume]), else: "{}"}
@@ -464,7 +494,7 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
       </div>
 
       <div class="rounded-xl border border-base-300 bg-base-100 p-4">
-        <h2 class="font-semibold">By node</h2>
+        <h2 class="text-lg font-semibold tracking-tight">By node</h2>
         <.result_table id="analysis-nodes" label_header="Node" result={@nodes} />
       </div>
 

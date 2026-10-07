@@ -102,6 +102,15 @@
 /* Make LiveView wrapper divs transparent for layout */
 [data-phx-session], [data-phx-teleported-src] { display: contents }
 
+/* Visible keyboard focus on every interactive element, in both themes.
+   One rule in the shared bundle (rather than per-template classes) is what
+   keeps focus visible on every page. The semantic token keeps light and dark
+   together; nothing here removes an outline without replacing it. */
+:where(a, button, input, select, textarea, [tabindex]):focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+}
+
 /* Log viewer table: one explicit column layout shared by the header and every
    row, so timestamp, level, node, message, source, and actions line up down
    the page. Widths are CSS variables on `#logs-table`, tuned in the browser by

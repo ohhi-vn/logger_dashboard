@@ -378,6 +378,18 @@ defmodule LoggerDashboardWeb.LogLiveTest do
              )
     end
 
+    test "a multi-level scope shows either level and excludes the rest", %{
+      conn: conn,
+      tag: tag
+    } do
+      {:ok, lv, _html} =
+        live(conn, "/logs?node=#{tag}&level=" <> URI.encode_www_form("error,warning"))
+
+      assert has_element?(lv, "#logs-list [data-level=error]")
+      assert has_element?(lv, "#logs-list [data-level=warning]")
+      refute has_element?(lv, "#logs-list [data-level=info]")
+    end
+
     test "level is both an accent on the row and readable text", %{conn: conn, tag: tag} do
       {:ok, lv, _html} = live(conn, ~p"/logs?node=#{tag}")
 
@@ -977,7 +989,7 @@ defmodule LoggerDashboardWeb.LogLiveTest do
       assert has_element?(lv, ~s(#logs-active-nodes [data-node="b@h"]))
 
       # The other filters survive the toggle.
-      assert has_element?(lv, ~s(#filters_level option[value="error"][selected]))
+      assert has_element?(lv, ~s(#logs-level-options [data-level="error"][aria-pressed="true"]))
     end
 
     test "toggling a selected node removes it, and the last one returns to all nodes", %{
@@ -1003,21 +1015,42 @@ defmodule LoggerDashboardWeb.LogLiveTest do
       assert has_element?(lv, ~s(#logs-active-nodes [data-node="a@h"]))
     end
 
-    test "clicking a level selects it and clicking all clears it", %{conn: conn} do
+    test "clicking levels toggles them and clicking all clears the set", %{conn: conn} do
       {:ok, lv, _html} = live(conn, ~p"/logs")
 
       render_click(lv, "select-level", %{"level" => "warning"})
 
-      assert has_element?(lv, ~s(#filters_level option[value="warning"][selected]))
       assert has_element?(lv, ~s(#logs-level-options [data-level="warning"][aria-pressed="true"]))
 
+      # Clicking a second level adds it instead of replacing the first.
       render_click(lv, "select-level", %{"level" => "info"})
 
-      assert has_element?(lv, ~s(#filters_level option[value="info"][selected]))
+      assert has_element?(lv, ~s(#logs-level-options [data-level="warning"][aria-pressed="true"]))
+      assert has_element?(lv, ~s(#logs-level-options [data-level="info"][aria-pressed="true"]))
+
+      # Clicking a selected level removes it again.
+      render_click(lv, "select-level", %{"level" => "warning"})
+
+      assert has_element?(
+               lv,
+               ~s(#logs-level-options [data-level="warning"][aria-pressed="false"])
+             )
+
+      assert has_element?(lv, ~s(#logs-level-options [data-level="info"][aria-pressed="true"]))
 
       render_click(lv, "select-level", %{"level" => "all"})
 
-      assert has_element?(lv, ~s(#filters_level option[value="all"][selected]))
+      assert has_element?(lv, ~s(#logs-level-options [data-level="all"][aria-pressed="true"]))
+    end
+
+    test "a multi-level scope marks every selected level", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, "/logs?level=" <> URI.encode_www_form("error,warning"))
+
+      assert has_element?(lv, ~s(#logs-level-options [data-level="error"][aria-pressed="true"]))
+      assert has_element?(lv, ~s(#logs-level-options [data-level="warning"][aria-pressed="true"]))
+      assert has_element?(lv, ~s(#logs-level-options [data-level="info"][aria-pressed="false"]))
+      assert has_element?(lv, ~s(#logs-level-options [data-level="error"][aria-pressed="true"]))
+      assert has_element?(lv, ~s(#logs-level-options [data-level="warning"][aria-pressed="true"]))
     end
 
     test "clicking an unknown level is ignored", %{conn: conn} do
@@ -1025,7 +1058,18 @@ defmodule LoggerDashboardWeb.LogLiveTest do
 
       render_click(lv, "select-level", %{"level" => "fatal"})
 
-      assert has_element?(lv, ~s(#filters_level option[value="error"][selected]))
+      assert has_element?(lv, ~s(#logs-level-options [data-level="error"][aria-pressed="true"]))
+    end
+
+    test "level selector is a single badge group inside the filter card", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/logs")
+
+      assert has_element?(lv, "#logs-filter-form #logs-level-options")
+      refute has_element?(lv, "#filters_level")
+
+      for level <- ~w(error warning info debug all) do
+        assert has_element?(lv, ~s(#logs-level-options [data-level="#{level}"]))
+      end
     end
   end
 

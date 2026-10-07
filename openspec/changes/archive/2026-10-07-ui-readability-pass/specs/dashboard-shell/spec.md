@@ -1,43 +1,6 @@
-# Dashboard Shell Specification
+# Spec Delta
 
-## Purpose
-
-Gives the dashboard a real entry point and a consistent navigation frame so operators can move between viewing, analyzing, and pruning logs without typing URLs.
-
-## Requirements
-
-### Requirement: Dashboard homepage
-
-The system SHALL serve a dashboard homepage at `/` that identifies the application and links to each tool: Logs, Analysis, and Prune. It SHALL NOT show the Phoenix framework marketing content.
-
-#### Scenario: Homepage lists every tool
-
-- **WHEN** user visits `/`
-- **THEN** the page contains links to `/logs`, `/analysis`, and `/prune`
-
-#### Scenario: Homepage replaces the boilerplate
-
-- **WHEN** user visits `/`
-- **THEN** the page does not show Phoenix framework marketing copy
-
-### Requirement: Cross-page navigation
-
-The system SHALL render a persistent navigation affordance on every dashboard page that links to the homepage and to each tool, and SHALL mark the current page as active.
-
-#### Scenario: Navigation present on every page
-
-- **WHEN** user views the homepage, Logs, Analysis, or Prune
-- **THEN** links to the homepage and to Logs, Analysis, and Prune are present
-
-#### Scenario: Current page is marked
-
-- **WHEN** user is on a tool page
-- **THEN** the navigation marks that tool as the active page in a way assistive technology can detect
-
-#### Scenario: Theme toggle remains available
-
-- **WHEN** user views any page
-- **THEN** the light/dark/system theme toggle is available
+## MODIFIED Requirements
 
 ### Requirement: Consistent page shell
 
@@ -85,27 +48,3 @@ The shell SHALL give every page the same visual language for repeated elements: 
 
 - **WHEN** any dashboard page renders in any offered theme
 - **THEN** body text contrast against its background meets WCAG AA (4.5:1)
-
-### Requirement: The shell offers a way to end the session
-
-The system SHALL render a sign-out control in the navigation frame on every
-authenticated dashboard page. The control SHALL be reachable by keyboard and exposed to
-assistive technology with a name that says it ends the session.
-
-The control SHALL NOT appear on the token page, which is not an authenticated dashboard
-page and has no session to end.
-
-#### Scenario: Sign-out is available on every page
-
-- **WHEN** user views the homepage, Logs, Analysis, or Prune while authenticated
-- **THEN** a sign-out control is present in the navigation frame
-
-#### Scenario: The control is identifiable to assistive technology
-
-- **WHEN** a screen reader reaches the sign-out control
-- **THEN** it is named as ending the session rather than only its position or icon
-
-#### Scenario: The control is absent from the token page
-
-- **WHEN** the token page renders
-- **THEN** no sign-out control is present, because there is no session to end

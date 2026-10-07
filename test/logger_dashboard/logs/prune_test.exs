@@ -80,7 +80,7 @@ defmodule LoggerDashboard.Logs.PruneTest do
 
     {sql, params} = Prune.where_clause(filter)
     assert sql =~ "node IN (?)"
-    assert sql =~ "level = ?"
+    assert sql =~ "level IN (?)"
     assert sql =~ "timestamp >="
     assert length(params) == 3
     refute sql =~ "message"

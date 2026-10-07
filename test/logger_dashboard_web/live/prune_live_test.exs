@@ -195,6 +195,33 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
     end
   end
 
+  # `ClickhouseExLogger.Insert` writes with async insert, so an accepted row is
+  # not immediately visible to a read. Polling for the node keeps assertions on
+  # real query results instead of a fixed sleep.
+  defp await_node_visible(node, expected \\ 1, attempts \\ 20) do
+    count = fn ->
+      {:ok, result} =
+        ClickhouseExLogger.Repo.query("SELECT count(*) FROM logs WHERE node = ?", [node])
+
+      case result.rows do
+        [[count]] -> count
+        _ -> 0
+      end
+    end
+
+    cond do
+      count.() >= expected ->
+        :ok
+
+      attempts == 0 ->
+        flunk("rows for node #{inspect(node)} never became visible")
+
+      true ->
+        Process.sleep(250)
+        await_node_visible(node, expected, attempts - 1)
+    end
+  end
+
   describe "index preview count and sample" do
     @describetag :clickhouse
 
@@ -222,7 +249,7 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
         end
 
       assert {:ok, _} = ClickhouseExLogger.Insert.insert(rows)
-      Process.sleep(2_000)
+      await_node_visible(node, 2)
 
       on_exit(fn -> ClickhouseExLogger.Repo.query("DELETE FROM logs WHERE node = ?", [node]) end)
 
@@ -288,7 +315,7 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
       }
 
       assert {:ok, 1} = ClickhouseExLogger.Insert.insert([row])
-      Process.sleep(2_000)
+      await_node_visible(tag)
 
       on_exit(fn -> ClickhouseExLogger.Repo.query("DELETE FROM logs WHERE node = ?", [tag]) end)
 
@@ -513,7 +540,7 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
       }
 
       assert {:ok, 1} = ClickhouseExLogger.Insert.insert([row])
-      Process.sleep(2_000)
+      await_node_visible(node)
 
       {:ok, lv, _html} = live(conn, ~p"/prune")
 
@@ -555,7 +582,7 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
       }
 
       assert {:ok, 1} = ClickhouseExLogger.Insert.insert([row])
-      Process.sleep(2_000)
+      await_node_visible(node)
 
       {:ok, lv, _html} = live(conn, ~p"/prune")
 
@@ -601,7 +628,7 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
       }
 
       assert {:ok, 1} = ClickhouseExLogger.Insert.insert([row])
-      Process.sleep(2_000)
+      await_node_visible(node)
 
       {:ok, lv, _html} = live(conn, ~p"/prune")
 

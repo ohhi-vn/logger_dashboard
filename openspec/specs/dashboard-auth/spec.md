@@ -133,6 +133,11 @@ The token page SHALL be reachable without an authenticated session, and SHALL be
 protected against cross-site request forgery in the same way as every other form in the
 dashboard.
 
+The token page SHALL use the shell's shared visual language for its card, input,
+button, and error styling. The rejection error SHALL name the problem in text and SHALL
+NOT rely on color alone, and the field and submit control SHALL show a visible
+keyboard-focus indicator.
+
 #### Scenario: A valid token starts a session and returns the operator
 
 - **WHEN** an unauthenticated user is redirected from `/logs` to the token page and
@@ -149,6 +154,12 @@ dashboard.
 
 - **WHEN** an unauthenticated request reaches the token page directly
 - **THEN** the page is rendered with the token form and no dashboard content
+
+#### Scenario: The token page matches the dashboard form language
+
+- **WHEN** user views the token page
+- **THEN** its card, input, button, and error use the shell's shared styling, so it
+  reads as part of the same product rather than a one-off page
 
 ### Requirement: An authenticated session is bound to the current token
 

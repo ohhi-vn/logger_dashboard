@@ -97,7 +97,7 @@ defmodule LoggerDashboard.Logs.LogReadTest do
       seed(tag, "new error", :error, ~U[2026-06-01 00:00:00.000000Z])
       seed(tag, "new info", :info, ~U[2026-06-01 00:00:00.000000Z])
 
-      {:ok, rows, _has_more} = LogRead.list_logs(%Filter{nodes: [tag], level: "error"})
+      {:ok, rows, _has_more} = LogRead.list_logs(%Filter{nodes: [tag], levels: ["error"]})
       assert Enum.map(rows, & &1.message) == ["new error", "old error"]
 
       {:ok, rows, _has_more} =
@@ -290,7 +290,7 @@ defmodule LoggerDashboard.Logs.LogReadTest do
       seed(tag, "new error", :error, ~U[2026-06-01 00:00:00.000000Z])
       seed(tag, "new info", :info, ~U[2026-06-01 00:00:00.000000Z])
 
-      assert {:ok, 2} = LogRead.count_logs(%Filter{nodes: [tag], level: "error"})
+      assert {:ok, 2} = LogRead.count_logs(%Filter{nodes: [tag], levels: ["error"]})
 
       assert {:ok, 2} =
                LogRead.count_logs(%Filter{nodes: [tag], from: ~U[2026-03-01 00:00:00.000000Z]})

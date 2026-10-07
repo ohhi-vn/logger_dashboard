@@ -239,7 +239,18 @@ defmodule LoggerDashboard.Logs.AnalysisTest do
     filters = Analysis.dyan_filters(filter)
     refute Map.has_key?(filters, :message)
     assert filters.node == %{in: ["a@b"]}
-    assert filters.level == "error"
+    assert filters.level == %{in: ["error"]}
+  end
+
+  test "dyan_filters emits an in filter for multiple levels and omits it when empty" do
+    assert {:ok, filter} = Filter.parse(%{"level" => "error,warning"})
+    assert Analysis.dyan_filters(filter).level == %{in: ["error", "warning"]}
+
+    assert {:ok, filter} = Filter.parse(%{"level" => "all"})
+    refute Map.has_key?(Analysis.dyan_filters(filter), :level)
+
+    assert {:ok, filter} = Filter.parse(%{})
+    refute Map.has_key?(Analysis.dyan_filters(filter), :level)
   end
 
   test "dyan_filters emits an in filter for multiple nodes and omits it when empty" do

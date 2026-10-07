@@ -129,7 +129,12 @@ defmodule LoggerDashboardWeb.AnalysisLiveTest do
       {:ok, lv, _html} = live(conn, "/analysis?node=a@h&search=*boom*&level=error")
 
       assert input_value(lv, "filters_search") == "*boom*"
-      assert has_element?(lv, ~s(#filters_level option[value="error"][selected]))
+
+      assert has_element?(
+               lv,
+               ~s(#analysis-level-options [data-level="error"][aria-pressed="true"])
+             )
+
       assert has_element?(lv, ~s(#analysis-active-nodes [data-node="a@h"]))
     end
 
@@ -151,7 +156,11 @@ defmodule LoggerDashboardWeb.AnalysisLiveTest do
 
       assert has_element?(lv, ~s(#analysis-active-nodes [data-node="a@h"]))
       assert has_element?(lv, ~s(#analysis-active-nodes [data-node="b@h"]))
-      assert has_element?(lv, ~s(#filters_level option[value="error"][selected]))
+
+      assert has_element?(
+               lv,
+               ~s(#analysis-level-options [data-level="error"][aria-pressed="true"])
+             )
     end
 
     test "toggling a selected node removes it, and the last one returns to all nodes", %{
@@ -177,25 +186,67 @@ defmodule LoggerDashboardWeb.AnalysisLiveTest do
       assert has_element?(lv, ~s(#analysis-active-nodes [data-node="a@h"]))
     end
 
-    test "clicking a level selects it and clicking all clears it", %{conn: conn} do
+    test "clicking levels toggles them and clicking all clears the set", %{conn: conn} do
       {:ok, lv, _html} = live(conn, ~p"/analysis")
 
       render_click(lv, "select-level", %{"level" => "warning"})
-
-      assert has_element?(lv, ~s(#filters_level option[value="warning"][selected]))
 
       assert has_element?(
                lv,
                ~s(#analysis-level-options [data-level="warning"][aria-pressed="true"])
              )
 
+      # Clicking a second level adds it instead of replacing the first.
       render_click(lv, "select-level", %{"level" => "info"})
 
-      assert has_element?(lv, ~s(#filters_level option[value="info"][selected]))
+      assert has_element?(
+               lv,
+               ~s(#analysis-level-options [data-level="warning"][aria-pressed="true"])
+             )
+
+      assert has_element?(
+               lv,
+               ~s(#analysis-level-options [data-level="info"][aria-pressed="true"])
+             )
+
+      # Clicking a selected level removes it again.
+      render_click(lv, "select-level", %{"level" => "warning"})
+
+      assert has_element?(
+               lv,
+               ~s(#analysis-level-options [data-level="warning"][aria-pressed="false"])
+             )
+
+      assert has_element?(
+               lv,
+               ~s(#analysis-level-options [data-level="info"][aria-pressed="true"])
+             )
 
       render_click(lv, "select-level", %{"level" => "all"})
 
-      assert has_element?(lv, ~s(#filters_level option[value="all"][selected]))
+      assert has_element?(
+               lv,
+               ~s(#analysis-level-options [data-level="all"][aria-pressed="true"])
+             )
+    end
+
+    test "a multi-level scope marks every selected level", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, "/analysis?level=" <> URI.encode_www_form("error,warning"))
+
+      assert has_element?(
+               lv,
+               ~s(#analysis-level-options [data-level="error"][aria-pressed="true"])
+             )
+
+      assert has_element?(
+               lv,
+               ~s(#analysis-level-options [data-level="warning"][aria-pressed="true"])
+             )
+
+      assert has_element?(
+               lv,
+               ~s(#analysis-level-options [data-level="info"][aria-pressed="false"])
+             )
     end
 
     test "clicking an unknown level is ignored", %{conn: conn} do
@@ -203,7 +254,21 @@ defmodule LoggerDashboardWeb.AnalysisLiveTest do
 
       render_click(lv, "select-level", %{"level" => "fatal"})
 
-      assert has_element?(lv, ~s(#filters_level option[value="error"][selected]))
+      assert has_element?(
+               lv,
+               ~s(#analysis-level-options [data-level="error"][aria-pressed="true"])
+             )
+    end
+
+    test "level selector is a single badge group inside the filter card", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/analysis")
+
+      assert has_element?(lv, "#analysis-filter-form #analysis-level-options")
+      refute has_element?(lv, "#filters_level")
+
+      for level <- ~w(error warning info debug all) do
+        assert has_element?(lv, ~s(#analysis-level-options [data-level="#{level}"]))
+      end
     end
   end
 

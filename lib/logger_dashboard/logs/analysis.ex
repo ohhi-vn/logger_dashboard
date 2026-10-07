@@ -36,7 +36,7 @@ defmodule LoggerDashboard.Logs.Analysis do
   def dyan_filters(%Filter{} = filter) do
     %{}
     |> maybe_put_nodes(filter.nodes)
-    |> maybe_put_level(filter.level)
+    |> maybe_put_level(filter.levels)
     |> maybe_put_range(filter.from, filter.to)
   end
 
@@ -185,8 +185,10 @@ defmodule LoggerDashboard.Logs.Analysis do
   defp maybe_put_nodes(map, []), do: map
   defp maybe_put_nodes(map, nodes), do: Map.put(map, :node, %{in: nodes})
 
-  defp maybe_put_level(map, "all"), do: map
+  defp maybe_put_level(map, []), do: map
   defp maybe_put_level(map, nil), do: map
+  defp maybe_put_level(map, "all"), do: map
+  defp maybe_put_level(map, levels) when is_list(levels), do: Map.put(map, :level, %{in: levels})
   defp maybe_put_level(map, level), do: Map.put(map, :level, level)
 
   defp maybe_put_range(map, nil, nil), do: map

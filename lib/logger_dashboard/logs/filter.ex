@@ -4,9 +4,12 @@ defmodule LoggerDashboard.Logs.Filter do
   predicate set.
 
   The node scope is a list: the `node` param accepts one or more node names
-  separated by commas, and an empty list means every node. Node, level,
-  timestamp, and message predicates are all emitted as bound parameters by
-  `predicates/1`, consumed by both the raw read path
+  separated by commas, and an empty list means every node. The level scope is
+  a list too: the `level` param accepts one or more of `error`, `warning`,
+  `info`, `debug` separated by commas (or a list from a multi-select form),
+  and an empty list — like an explicit `all` — means every level. Node,
+  level, timestamp, and message predicates are all emitted as bound
+  parameters by `predicates/1`, consumed by both the raw read path
   (`LoggerDashboard.Logs.LogRead`) and `LoggerDashboard.Logs.Prune`.
 
   Wildcard search cannot be pushed down through Ash: `Ash.Query.Operator`
@@ -16,6 +19,7 @@ defmodule LoggerDashboard.Logs.Filter do
   """
 
   @levels ~w(error warning info debug all)
+  @level_values ~w(error warning info debug)
   @default_limit 100
   @max_limit 3000
 
@@ -68,7 +72,7 @@ defmodule LoggerDashboard.Logs.Filter do
             from: nil,
             to: nil,
             preset: nil,
-            level: "all",
+            levels: [],
             limit: @default_limit,
             offset: 0
 
@@ -78,7 +82,7 @@ defmodule LoggerDashboard.Logs.Filter do
           from: DateTime.t() | nil,
           to: DateTime.t() | nil,
           preset: String.t() | nil,
-          level: String.t(),
+          levels: [String.t()],
           limit: pos_integer(),
           offset: non_neg_integer()
         }
@@ -91,7 +95,7 @@ defmodule LoggerDashboard.Logs.Filter do
     with {:ok, search} <- parse_search(params),
          {:ok, preset} <- parse_preset(params),
          {:ok, {from, to}} <- parse_range(params, preset),
-         {:ok, level} <- parse_level(params),
+         {:ok, levels} <- parse_levels(params),
          {:ok, {limit, offset}} <- parse_pagination(params) do
       {:ok,
        %__MODULE__{
@@ -100,7 +104,7 @@ defmodule LoggerDashboard.Logs.Filter do
          from: from,
          to: to,
          preset: preset,
-         level: level,
+         levels: levels,
          limit: limit,
          offset: offset
        }}
@@ -183,8 +187,8 @@ defmodule LoggerDashboard.Logs.Filter do
 
   Used to fill form fields from the parsed filter rather than from raw request
   params, so the inputs show the values the system actually applied — including
-  the instants a `preset` resolved to, and a `level` or `limit` that was
-  normalized or clamped during parsing.
+  the instants a `preset` resolved to, and levels normalized or clamped
+  during parsing.
   """
   @spec to_params(t()) :: %{String.t() => String.t()}
   def to_params(%__MODULE__{} = filter) do
@@ -193,7 +197,7 @@ defmodule LoggerDashboard.Logs.Filter do
       "search" => filter.search,
       "from" => iso8601(filter.from),
       "to" => iso8601(filter.to),
-      "level" => filter.level,
+      "level" => levels_to_param(filter.levels),
       "limit" => Integer.to_string(filter.limit),
       "offset" => Integer.to_string(filter.offset)
     }
@@ -264,25 +268,22 @@ defmodule LoggerDashboard.Logs.Filter do
   @doc """
   Build the shared `WHERE` clause for a validated filter.
 
-  Emits `node IN (...)`, `level`, and `timestamp` predicates plus
+  Emits `node IN (...)`, `level IN (...)`, and `timestamp` predicates plus
   `message LIKE ?` when and only when a search pattern is present. Every value
   is a bound parameter and no user input reaches the SQL string, so one clause
   set is safe for both the raw read path and prune. Callers append their own
   trailing clause (`ORDER BY`/`LIMIT` for reads, nothing for prune).
 
-  An empty node list applies no node predicate, so a filter with no active
-  predicate yields `{"1 = 1", []}`.
+  An empty node list applies no node predicate and an empty level list applies
+  no level predicate, so a filter with no active predicate yields
+  `{"1 = 1", []}`.
   """
   @spec predicates(t()) :: {String.t(), list()}
   def predicates(%__MODULE__{} = filter) do
     {clauses, params} = {[], []}
 
     {clauses, params} = maybe_push_nodes(clauses, params, filter.nodes)
-
-    {clauses, params} =
-      if filter.level in [nil, "all", ""],
-        do: {clauses, params},
-        else: maybe_push(clauses, params, "level = ?", filter.level)
+    {clauses, params} = maybe_push_levels(clauses, params, filter.levels)
 
     {clauses, params} =
       if filter.from,
@@ -311,6 +312,14 @@ defmodule LoggerDashboard.Logs.Filter do
     {["node IN (#{placeholders})" | clauses], Enum.reverse(nodes) ++ params}
   end
 
+  defp maybe_push_levels(clauses, params, []), do: {clauses, params}
+
+  defp maybe_push_levels(clauses, params, levels) do
+    placeholders = Enum.map_join(levels, ", ", fn _ -> "?" end)
+
+    {["level IN (#{placeholders})" | clauses], Enum.reverse(levels) ++ params}
+  end
+
   defp maybe_push(clauses, params, _clause, nil), do: {clauses, params}
   defp maybe_push(clauses, params, _clause, ""), do: {clauses, params}
 
@@ -322,7 +331,7 @@ defmodule LoggerDashboard.Logs.Filter do
   def default_limit, do: @default_limit
 
   @doc """
-  The level vocabulary the viewer's level control offers.
+  The level vocabulary the level badges offer, including the `all` reset.
 
   Owned here so the offered values have one source: the template renders this
   list rather than restating it, and the values cannot drift from the ones
@@ -330,6 +339,26 @@ defmodule LoggerDashboard.Logs.Filter do
   """
   @spec levels() :: [String.t()]
   def levels, do: @levels
+
+  @doc """
+  The levels a multi-level scope can hold — `levels/0` without `all`.
+
+  Owned here so the form multi-select offers exactly the filterable values:
+  `all` is a reset action on the badges, not a member of a set, so offering
+  it alongside real levels would let a scope contradict itself.
+  """
+  @spec level_values() :: [String.t()]
+  def level_values, do: @level_values
+
+  @doc """
+  Whether a level badge reads as active for a parsed level set.
+
+  `"all"` is active when the set is empty; any other level is active when it
+  is a member of the set.
+  """
+  @spec level_active?([String.t()], String.t()) :: boolean()
+  def level_active?(levels, "all"), do: levels == []
+  def level_active?(levels, level), do: level in levels
 
   @doc """
   The page sizes the viewer's per-page control offers, as strings.
@@ -362,15 +391,46 @@ defmodule LoggerDashboard.Logs.Filter do
     {:ok, get(params, "search", "") |> to_string()}
   end
 
-  defp parse_level(params) do
-    level = get(params, "level", "all") |> to_string() |> String.downcase()
+  @doc """
+  Parse the `level` param as a set of level names.
 
-    if level in @levels do
-      {:ok, level}
-    else
-      {:error, "invalid level #{inspect(level)}; expected one of #{Enum.join(@levels, ", ")}"}
+  Accepts a comma-separated string (`"error,warning"`), a list (from a
+  multi-select form), or nothing. Entries are trimmed, downcased, and
+  deduplicated; an absent, blank, or `all` input yields `[]`, the "all
+  levels" scope. An unknown entry rejects the whole filter.
+  """
+  @spec parse_levels(map()) :: {:ok, [String.t()]} | {:error, String.t()}
+  def parse_levels(params) do
+    params
+    |> get("level", nil)
+    |> to_level_list()
+    |> Enum.map(&(&1 |> to_string() |> String.trim() |> String.downcase()))
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.uniq()
+    |> validate_levels()
+  end
+
+  defp to_level_list(nil), do: []
+  defp to_level_list(values) when is_list(values), do: values
+  defp to_level_list(value), do: value |> to_string() |> String.split(",")
+
+  defp validate_levels(levels) do
+    cond do
+      "all" in levels ->
+        {:ok, []}
+
+      (unknown = levels -- @level_values) != [] ->
+        {:error,
+         "invalid level #{inspect(hd(unknown))}; expected one of #{Enum.join(@levels, ", ")}"}
+
+      true ->
+        {:ok, levels}
     end
   end
+
+  @doc "Render a level list back to its comma-separated form, for display or URL params."
+  @spec levels_to_param([String.t()]) :: String.t()
+  def levels_to_param(levels) when is_list(levels), do: Enum.join(levels, ",")
 
   defp parse_preset(params) do
     case get(params, "preset", nil) |> to_string() |> String.trim() do

@@ -59,7 +59,7 @@ defmodule LoggerDashboard.Logs.FilterTest do
       assert {sql, params} = Filter.predicates(filter)
 
       assert sql ==
-               "node IN (?) AND level = ? AND timestamp >= ? AND timestamp <= ? AND message LIKE ?"
+               "node IN (?) AND level IN (?) AND timestamp >= ? AND timestamp <= ? AND message LIKE ?"
 
       assert [node, level, from, to, pattern] = params
       assert node == "a@b"
@@ -79,7 +79,7 @@ defmodule LoggerDashboard.Logs.FilterTest do
 
       assert {sql, params} = Filter.predicates(filter)
 
-      assert sql == "node IN (?, ?) AND level = ? AND timestamp >= ?"
+      assert sql == "node IN (?, ?) AND level IN (?) AND timestamp >= ?"
       assert params == ["a@b", "c@d", "error", ~U[2026-09-01 00:00:00Z]]
     end
 
@@ -93,7 +93,7 @@ defmodule LoggerDashboard.Logs.FilterTest do
 
       {sql, params} = Filter.predicates(filter)
 
-      assert sql == "node IN (?) AND level = ? AND message LIKE ?"
+      assert sql == "node IN (?) AND level IN (?) AND message LIKE ?"
       refute sql =~ "DROP"
       assert params == ["'; DROP TABLE logs; --", "error", "%boom%"]
     end
@@ -112,6 +112,79 @@ defmodule LoggerDashboard.Logs.FilterTest do
       {:ok, filter} = Filter.parse(%{"level" => "all", "node" => ""})
       assert {sql, []} = Filter.predicates(filter)
       assert sql == "1 = 1"
+    end
+
+    test "multiple levels yield one IN clause with a placeholder per level" do
+      assert {:ok, filter} = Filter.parse(%{"level" => "error,warning"})
+
+      assert {sql, params} = Filter.predicates(filter)
+      assert sql == "level IN (?, ?)"
+      assert params == ["error", "warning"]
+    end
+
+    test "a single level yields a one-element IN clause" do
+      assert {:ok, filter} = Filter.parse(%{"level" => "error"})
+
+      assert {sql, params} = Filter.predicates(filter)
+      assert sql == "level IN (?)"
+      assert params == ["error"]
+    end
+  end
+
+  describe "parse_levels/1" do
+    test "splits comma-separated values" do
+      assert {:ok, %Filter{levels: ["error", "warning"]}} =
+               Filter.parse(%{"level" => "error,warning"})
+    end
+
+    test "a single value parses to a one-element set" do
+      assert {:ok, %Filter{levels: ["info"]}} = Filter.parse(%{"level" => "info"})
+    end
+
+    test "trims, downcases, and de-duplicates entries" do
+      assert {:ok, %Filter{levels: ["error", "warning"]}} =
+               Filter.parse(%{"level" => " Error , WARNING,error "})
+    end
+
+    test "accepts a list from a multi-select form" do
+      assert {:ok, %Filter{levels: ["error", "warning"]}} =
+               Filter.parse(%{"level" => ["error", "warning"]})
+    end
+
+    test "all, blank, and absent mean all levels" do
+      assert {:ok, %Filter{levels: []}} = Filter.parse(%{"level" => "all"})
+      assert {:ok, %Filter{levels: []}} = Filter.parse(%{"level" => "ALL"})
+      assert {:ok, %Filter{levels: []}} = Filter.parse(%{"level" => ""})
+      assert {:ok, %Filter{levels: []}} = Filter.parse(%{})
+    end
+
+    test "rejects an unknown level, including one among valid levels" do
+      assert {:error, message} = Filter.parse(%{"level" => "verbose"})
+      assert message =~ "invalid level"
+
+      assert {:error, _} = Filter.parse(%{"level" => "error,bogus"})
+    end
+  end
+
+  describe "levels_to_param/1 and level_active?/2" do
+    test "round-trips a parsed level set" do
+      assert %{"level" => "error,warning"}
+             |> Filter.parse_levels()
+             |> then(fn {:ok, levels} -> Filter.levels_to_param(levels) end) == "error,warning"
+
+      assert Filter.levels_to_param([]) == ""
+    end
+
+    test "all is active only for the empty set" do
+      assert Filter.level_active?([], "all")
+      refute Filter.level_active?(["error"], "all")
+      assert Filter.level_active?(["error", "warning"], "warning")
+      refute Filter.level_active?(["error"], "warning")
+    end
+
+    test "the form vocabulary excludes the all reset" do
+      assert Filter.level_values() == ["error", "warning", "info", "debug"]
+      assert "all" in Filter.levels()
     end
   end
 
@@ -176,7 +249,7 @@ defmodule LoggerDashboard.Logs.FilterTest do
                })
 
       assert f.nodes == ["my_app@10.0.0.5"]
-      assert f.level == "error"
+      assert f.levels == ["error"]
       assert f.search == "*boom*"
       assert f.limit == 25
     end
@@ -394,7 +467,7 @@ defmodule LoggerDashboard.Logs.FilterTest do
         Filter.predicates(preset_filter)
 
       assert sql ==
-               "node IN (?, ?) AND level = ? AND timestamp >= ? AND timestamp <= ? AND message LIKE ?"
+               "node IN (?, ?) AND level IN (?) AND timestamp >= ? AND timestamp <= ? AND message LIKE ?"
 
       assert node_a == "a@b"
       assert node_b == "c@d"
@@ -420,7 +493,7 @@ defmodule LoggerDashboard.Logs.FilterTest do
       assert {:ok, reparsed} = Filter.parse(Filter.to_params(filter))
 
       assert reparsed.nodes == filter.nodes
-      assert reparsed.level == filter.level
+      assert reparsed.levels == filter.levels
       assert reparsed.search == filter.search
       assert reparsed.from == filter.from
       assert reparsed.to == filter.to

@@ -78,6 +78,8 @@ The prune page SHALL present the known nodes as clickable options alongside the 
 
 The system SHALL require an explicit confirmation step that states the resolved scope (node/all-nodes, time range, levels) before any delete executes. The confirmation SHALL include the number of rows matching the resolved scope and a bounded sample of the newest matching rows, both computed from the same validated filter the delete will execute. The sample SHALL be bounded to a small fixed size and SHALL render each sampled row with its UTC `timestamp`, `level`, `node`, untruncated `message`, and source location when present. A scope that matches no rows SHALL state a zero count and offer no sample rows, and confirming it SHALL still require the explicit confirm action. Any change to the prune params SHALL clear the pending preview so a stale count or sample can never be confirmed for a different scope.
 
+The confirmation SHALL use the shell's shared visual language, and the destructive confirm action SHALL be visually unmistakable as destructive (not styled like a neutral primary action). Validation errors SHALL name the rejected field in text and SHALL NOT rely on color alone, and every control on the page SHALL show a visible keyboard-focus indicator.
+
 #### Scenario: Confirmation shows resolved scope
 
 - **WHEN** user submits a prune request
@@ -112,6 +114,16 @@ The system SHALL require an explicit confirmation step that states the resolved 
 
 - **WHEN** user cancels at the confirmation step
 - **THEN** system deletes zero rows
+
+#### Scenario: The confirm action reads as destructive
+
+- **WHEN** the confirmation step is shown
+- **THEN** the confirm action is styled as destructive and is visually distinct from neutral actions, so it cannot be mistaken for a harmless submit
+
+#### Scenario: Prune errors name the field in text
+
+- **WHEN** user submits a prune the system rejects
+- **THEN** the error names the rejected field in text rather than relying on color alone
 
 ### Requirement: Prune outcome reporting
 

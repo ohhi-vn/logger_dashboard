@@ -78,7 +78,7 @@ defmodule LoggerDashboard.Logs.Prune do
       [scope_text] ++
         if(filter.from, do: ["from #{filter.from}"], else: []) ++
         if(filter.to, do: ["to #{filter.to}"], else: []) ++
-        if filter.level != "all", do: ["level #{filter.level}"], else: []
+        if(filter.levels == [], do: [], else: ["level #{Enum.join(filter.levels, ", ")}"])
 
     Enum.join(parts, ", ")
   end

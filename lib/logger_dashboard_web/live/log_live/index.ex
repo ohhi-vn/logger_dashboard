@@ -47,8 +47,9 @@ defmodule LoggerDashboardWeb.LogLive.Index do
           |> assign(:filter_params, filter_params)
           # Built from the parsed filter, not the raw params, so the inputs show
           # the values that were actually applied — including the instants a
-          # `preset` resolved to, and a `level`/`limit` normalized during parse.
-          |> assign(:form, to_form(Filter.to_params(filter), as: :filters))
+          # `preset` resolved to, and levels normalized during parse. The level
+          # value is the parsed set as a list so the multi-select marks it.
+          |> assign(:form, to_form(form_params(filter), as: :filters))
           |> assign(:filter, filter)
           |> assign(:filter_error, nil)
           |> assign(:limit, filter.limit)
@@ -152,17 +153,37 @@ defmodule LoggerDashboardWeb.LogLive.Index do
 
   @impl true
   def handle_event("select-level", %{"level" => level}, socket) do
-    # A level click is a single-select through the same `level` param the form
-    # submits, so validation, bookmarking, and export stay unified. An unknown
-    # level is ignored here; hand-typed values still travel the form path where
-    # `Filter.parse/1` reports them.
+    # A level click toggles it in or out of the comma-separated set through
+    # the same `level` param the form submits, so validation, bookmarking, and
+    # export stay unified. Read back from the URL params rather than the
+    # parsed filter so the toggle also works while the page shows a validation
+    # error. An unknown level is ignored here; hand-typed values still travel
+    # the form path where `Filter.parse/1` reports them.
     level = level |> to_string() |> String.trim() |> String.downcase()
 
-    if level in Filter.levels() do
-      params = Map.put(socket.assigns.filter_params, "level", level)
-      {:noreply, push_patch(socket, to: ~p"/logs?#{params}")}
-    else
-      {:noreply, socket}
+    cond do
+      level == "all" ->
+        params = Map.delete(socket.assigns.filter_params, "level")
+        {:noreply, push_patch(socket, to: ~p"/logs?#{params}")}
+
+      level in Filter.level_values() ->
+        levels = selected_levels(socket.assigns.filter_params)
+
+        levels =
+          if level in levels,
+            do: Enum.reject(levels, &(&1 == level)),
+            else: levels ++ [level]
+
+        params =
+          case Filter.levels_to_param(levels) do
+            "" -> Map.delete(socket.assigns.filter_params, "level")
+            param -> Map.put(socket.assigns.filter_params, "level", param)
+          end
+
+        {:noreply, push_patch(socket, to: ~p"/logs?#{params}")}
+
+      true ->
+        {:noreply, socket}
     end
   end
 
@@ -322,10 +343,27 @@ defmodule LoggerDashboardWeb.LogLive.Index do
     |> Map.new()
   end
 
-  defp normalize_filter_params(%{"filters" => filters}) when is_map(filters), do: filters
+  # The form no longer carries a level input — badges toggle through the
+  # `level` URL param — so the form params are exactly the parsed filter.
+  defp form_params(%Filter{} = filter) do
+    Filter.to_params(filter)
+  end
+
+  defp normalize_filter_params(%{"filters" => filters}) when is_map(filters),
+    do: Map.take(filters, @filter_keys)
 
   defp normalize_filter_params(params) when is_map(params),
     do: Map.take(params, @filter_keys)
+
+  # The level set is read straight off the params rather than the parsed
+  # filter, so the toggle badges stay correct even when another filter in the
+  # same request failed validation and left the query unparsed.
+  defp selected_levels(filter_params) do
+    case Filter.parse_levels(filter_params) do
+      {:ok, levels} -> levels
+      {:error, _} -> []
+    end
+  end
 
   # The per-page options follow the `limit` the select actually shows, including
   # on the rejected-filter path where the rest of the form is built from raw
@@ -451,33 +489,6 @@ defmodule LoggerDashboardWeb.LogLive.Index do
         </span>
       </div>
 
-      <%!-- Clickable single-select levels through the same `level` param the
-            form submits, so validation and bookmarks stay unified. --%>
-      <div
-        id="logs-level-options"
-        class="flex flex-wrap items-center gap-2 text-sm"
-        role="group"
-        aria-label="Level filter"
-      >
-        <span class="text-base-content/70">Level:</span>
-        <button
-          :for={level <- Filter.levels()}
-          type="button"
-          id={"logs-level-#{level}"}
-          phx-click="select-level"
-          phx-value-level={level}
-          data-level={level}
-          aria-pressed={to_string(@filter.level == level)}
-          class={[
-            "badge cursor-pointer border uppercase",
-            @filter.level == level && "badge-primary",
-            @filter.level != level && "badge-outline badge-ghost hover:badge-primary"
-          ]}
-        >
-          {level}
-        </button>
-      </div>
-
       <.form
         for={@form}
         id="logs-filter-form"
@@ -491,16 +502,42 @@ defmodule LoggerDashboardWeb.LogLive.Index do
             placeholder="my_app@10.0.0.5, my_app@10.0.0.6"
           />
         </div>
-        <.input field={@form[:search]} label="Search (* wildcards)" placeholder="*timeout*" />
+        <div class="md:col-span-2">
+          <.input field={@form[:search]} label="Search (* wildcards)" placeholder="*timeout*" />
+        </div>
         <.bound id="logs" bound={:from} field={@form[:from]} label="From (UTC)" />
         <.bound id="logs" bound={:to} field={@form[:to]} label="To (UTC)" />
-        <.input
-          field={@form[:level]}
-          label="Level"
-          type="select"
-          options={["all", "error", "warning", "info", "debug"]}
-        />
-        <.input field={@form[:limit]} label="Per page" type="select" options={@limit_options} />
+        <%!-- Single level selector: toggle badges through the `level` URL param.
+              Full-width row so wrapping grows the card instead of overlapping
+              neighbouring inputs. An empty set (or `all`) applies no predicate. --%>
+        <div
+          id="logs-level-options"
+          class="flex flex-wrap items-center gap-2 text-sm md:col-span-6"
+          role="group"
+          aria-label="Level filter"
+        >
+          <span class="text-base-content/70">Level:</span>
+          <button
+            :for={level <- Filter.levels()}
+            type="button"
+            id={"logs-level-#{level}"}
+            phx-click="select-level"
+            phx-value-level={level}
+            data-level={level}
+            aria-pressed={to_string(Filter.level_active?(@filter.levels, level))}
+            class={[
+              "badge cursor-pointer border uppercase",
+              Filter.level_active?(@filter.levels, level) && "badge-primary",
+              !Filter.level_active?(@filter.levels, level) &&
+                "badge-outline badge-ghost hover:badge-primary"
+            ]}
+          >
+            {level}
+          </button>
+        </div>
+        <div class="md:col-span-2">
+          <.input field={@form[:limit]} label="Per page" type="select" options={@limit_options} />
+        </div>
         <div class="md:col-span-6 flex flex-wrap items-center justify-between gap-2">
           <div class="flex gap-2">
             <.button>Apply filters</.button>
@@ -648,7 +685,7 @@ defmodule LoggerDashboardWeb.LogLive.Index do
                 data-role="log-copy"
                 aria-label={"Copy #{LogLine.timestamp(log)}"}
                 title={LogLine.format(log)}
-                class="btn btn-ghost btn-xs shrink-0 px-1 text-base-content/50"
+                class="btn btn-ghost btn-xs shrink-0 px-1 text-base-content/70"
               >
                 <.icon name="hero-clipboard" class="size-3.5" />
               </button>
@@ -661,7 +698,7 @@ defmodule LoggerDashboardWeb.LogLive.Index do
                 aria-expanded={to_string(@expanded_id == dom_id)}
                 aria-controls={@expanded_id == dom_id && "logs-expanded-#{dom_id}"}
                 aria-label={"Expand #{LogLine.timestamp(log)}"}
-                class="btn btn-ghost btn-xs shrink-0 px-1 text-base-content/50"
+                class="btn btn-ghost btn-xs shrink-0 px-1 text-base-content/70"
               >
                 <.icon
                   name="hero-chevron-down"

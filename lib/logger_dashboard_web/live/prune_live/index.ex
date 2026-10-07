@@ -510,7 +510,10 @@ defmodule LoggerDashboardWeb.PruneLive.Index do
             />
           </div>
           <div class="md:col-span-2">
-            <.button>Preview prune</.button>
+            <div class="flex gap-2">
+              <.button>Preview prune</.button>
+              <.link navigate={~p"/prune"} class="btn btn-ghost">Reset</.link>
+            </div>
           </div>
         </.form>
 
@@ -557,8 +560,12 @@ defmodule LoggerDashboardWeb.PruneLive.Index do
               Async apply; no undo. Whole-system prunes delete every node.
             </p>
             <div class="flex gap-2">
-              <.button phx-click="confirm" id="prune-confirm-button">Confirm delete</.button>
-              <.button phx-click="cancel" id="prune-cancel-button">Cancel</.button>
+              <.button phx-click="confirm" id="prune-confirm-button" class="btn btn-error">
+                Confirm delete
+              </.button>
+              <.button phx-click="cancel" id="prune-cancel-button" class="btn btn-ghost">
+                Cancel
+              </.button>
             </div>
           </div>
         <% end %>
@@ -573,7 +580,7 @@ defmodule LoggerDashboardWeb.PruneLive.Index do
         <section class="rounded-xl border border-base-300 bg-base-100 p-4" id="prune-retention">
           <div class="flex flex-wrap items-start justify-between gap-3">
             <div>
-              <h2 class="text-lg font-bold tracking-tight">Scheduled retention</h2>
+              <h2 class="text-lg font-semibold tracking-tight">Scheduled retention</h2>
               <p class="text-sm text-base-content/70">
                 Deletes logs older than the retained age, across every node, once a day without anyone watching.
               </p>
