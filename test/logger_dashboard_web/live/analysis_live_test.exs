@@ -272,6 +272,63 @@ defmodule LoggerDashboardWeb.AnalysisLiveTest do
     end
   end
 
+  describe "redesigned filter" do
+    test "badges are the only node selector with select-all and Refresh, no Run or Reset", %{
+      conn: conn
+    } do
+      {:ok, lv, _html} = live(conn, ~p"/analysis")
+
+      assert has_element?(lv, "#analysis-node-options")
+      assert has_element?(lv, "#analysis-select-all-nodes")
+      assert has_element?(lv, "#analysis-refresh")
+
+      refute has_element?(lv, ~s(#analysis-filter-form input[name="filters[node]"]))
+      refute lv |> element("#analysis-filter-form") |> render() =~ "Run analysis"
+      refute has_element?(lv, "#analysis-filter-form a", "Reset")
+    end
+
+    test "select-all returns to whole-system scope and keeps the level", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, "/analysis?node=a@h&level=error")
+
+      assert has_element?(lv, "#analysis-select-all-nodes:not([hidden])")
+
+      lv |> element("#analysis-select-all-nodes") |> render_click()
+
+      assert has_element?(lv, "#analysis-active-nodes[hidden]")
+
+      assert has_element?(
+               lv,
+               ~s(#analysis-level-options [data-level="error"][aria-pressed="true"])
+             )
+    end
+
+    test "committing the form keeps the badge-selected node scope", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, "/analysis?node=a@h")
+
+      lv
+      |> form("#analysis-filter-form", filters: %{search: "*boom*"})
+      |> render_submit()
+
+      assert has_element?(lv, ~s(#analysis-active-nodes [data-node="a@h"]))
+      assert input_value(lv, "filters_search") == "*boom*"
+    end
+
+    test "refresh recomputes the current URL scope without changing it", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, "/analysis?node=a@h&level=error")
+
+      lv |> element("#analysis-refresh") |> render_click()
+
+      assert has_element?(lv, ~s(#analysis-active-nodes [data-node="a@h"]))
+
+      assert has_element?(
+               lv,
+               ~s(#analysis-level-options [data-level="error"][aria-pressed="true"])
+             )
+
+      refute has_element?(lv, "#analysis-filter-error")
+    end
+  end
+
   defp input_value(lv, id) do
     case lv |> element("##{id}") |> render() |> then(&Regex.run(~r/\bvalue="([^"]*)"/, &1)) do
       [_, value] -> value

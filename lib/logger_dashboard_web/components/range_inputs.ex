@@ -194,6 +194,8 @@ defmodule LoggerDashboardWeb.RangeInputs do
 
   # The duration comes from `Filter.presets/1` rather than a copy of the id, so
   # a label can never drift from the range the button actually applies.
+  defp label(:age, _preset_id, :all_time), do: "All time"
+
   defp label(:window, _preset_id, {amount, unit}) do
     "Last #{amount} #{unit_name(unit, amount)}"
   end

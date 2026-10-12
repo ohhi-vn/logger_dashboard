@@ -479,7 +479,7 @@ defmodule LoggerDashboardWeb.LogLiveTest do
       refute has_element?(lv, "#logs-expanded-#{id} [data-role=log-metadata]")
     end
 
-    test "opening a second row collapses the first", %{conn: conn, tag: tag} do
+    test "opening a second row keeps the first expanded", %{conn: conn, tag: tag} do
       {:ok, lv, _html} = live(conn, ~p"/logs?node=#{tag}")
 
       error_id = row_id(lv, "error")
@@ -491,7 +491,27 @@ defmodule LoggerDashboardWeb.LogLiveTest do
       lv |> element("#logs-expand-#{warning_id}") |> render_click()
 
       assert has_element?(lv, "#logs-expanded-#{warning_id}")
+      assert has_element?(lv, "#logs-expanded-#{error_id}")
+    end
+
+    test "expand-all reveals every row and collapse-all hides them again", %{
+      conn: conn,
+      tag: tag
+    } do
+      {:ok, lv, _html} = live(conn, ~p"/logs?node=#{tag}")
+
+      error_id = row_id(lv, "error")
+      warning_id = row_id(lv, "warning")
+
+      lv |> element("#logs-expand-all") |> render_click()
+
+      assert has_element?(lv, "#logs-expanded-#{error_id}")
+      assert has_element?(lv, "#logs-expanded-#{warning_id}")
+
+      lv |> element("#logs-collapse-all") |> render_click()
+
       refute has_element?(lv, "#logs-expanded-#{error_id}")
+      refute has_element?(lv, "#logs-expanded-#{warning_id}")
     end
 
     test "toggling the same row twice collapses it again", %{conn: conn, tag: tag} do
@@ -1070,6 +1090,66 @@ defmodule LoggerDashboardWeb.LogLiveTest do
       for level <- ~w(error warning info debug all) do
         assert has_element?(lv, ~s(#logs-level-options [data-level="#{level}"]))
       end
+    end
+  end
+
+  describe "index redesigned filter" do
+    test "badges are the only node selector with select-all and Refresh, no Apply or Reset", %{
+      conn: conn
+    } do
+      {:ok, lv, _html} = live(conn, ~p"/logs")
+
+      assert has_element?(lv, "#logs-node-options")
+      assert has_element?(lv, "#logs-select-all-nodes")
+      assert has_element?(lv, "#logs-refresh")
+
+      # No free-text node input and no Apply/Reset submits anywhere.
+      refute has_element?(lv, ~s(#logs-filter-form input[name="filters[node]"]))
+      refute lv |> element("#logs-filter-form") |> render() =~ "Apply filters"
+      refute has_element?(lv, "#logs-filter-form a", "Reset")
+    end
+
+    test "select-all returns to whole-system scope and keeps other filters", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/logs?node=a%40h&level=error")
+
+      assert has_element?(lv, "#logs-select-all-nodes:not([hidden])")
+
+      lv |> element("#logs-select-all-nodes") |> render_click()
+
+      assert has_element?(lv, "#logs-active-nodes[hidden]")
+      assert has_element?(lv, "#logs-select-all-nodes[hidden]")
+
+      # The level filter survives, so select-all does not widen the rest.
+      assert has_element?(lv, ~s(#logs-level-options [data-level="error"][aria-pressed="true"]))
+    end
+
+    test "committing the form keeps the badge-selected node scope", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/logs?node=a%40h")
+
+      lv
+      |> form("#logs-filter-form", filters: %{search: "*boom*"})
+      |> render_submit()
+
+      # The node scope came from badges, which the form no longer carries, so
+      # it must survive the commit through the URL params rather than be
+      # dropped back to all nodes.
+      assert has_element?(lv, ~s(#logs-active-nodes [data-node="a@h"]))
+      assert lv |> element("#logs-filter-form") |> render() =~ "*boom*"
+    end
+
+    test "refresh re-runs the current URL filters without changing them", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/logs?node=a%40h&level=error")
+
+      lv |> element("#logs-refresh") |> render_click()
+
+      assert has_element?(lv, ~s(#logs-active-nodes [data-node="a@h"]))
+
+      assert has_element?(
+               lv,
+               ~s(#logs-level-options [data-level="error"][aria-pressed="true"])
+             )
+
+      refute has_element?(lv, "#logs-filter-error")
     end
   end
 

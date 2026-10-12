@@ -55,6 +55,18 @@ defmodule LoggerDashboard.Logs.PruneTest do
     assert {:error, _} = Prune.parse(%{"scope" => "node", "node" => "a@b"})
   end
 
+  test "parse accepts an explicitly unbounded prune only with the all-time mark" do
+    assert {:ok, filter, :all} = Prune.parse(%{"scope" => "all", "preset" => "age:all"})
+    assert filter.from == nil
+    assert filter.to == nil
+
+    assert {:ok, _filter, :node} =
+             Prune.parse(%{"scope" => "node", "node" => "a@b", "preset" => "age:all"})
+
+    # The same bounds without the mark stay rejected.
+    assert {:error, _} = Prune.parse(%{"scope" => "all"})
+  end
+
   test "parse accepts a one-sided range" do
     assert {:ok, f, :node} =
              Prune.parse(%{"scope" => "node", "node" => "a@b", "from" => "2026-09-01T00:00:00Z"})

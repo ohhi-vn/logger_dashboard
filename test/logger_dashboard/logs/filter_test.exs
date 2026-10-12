@@ -286,8 +286,16 @@ defmodule LoggerDashboard.Logs.FilterTest do
                {"3d", {3, :day}},
                {"7d", {7, :day}},
                {"30d", {30, :day}},
-               {"90d", {90, :day}}
+               {"90d", {90, :day}},
+               {"all", :all_time}
              ]
+    end
+
+    test "the timeless all entry sorts last in the age family" do
+      assert List.last(Filter.presets(:age)) == {"all", :all_time}
+      assert Filter.all_time?(Filter.preset_id(:age, "all"))
+      refute Filter.all_time?("age:7d")
+      refute Filter.all_time?(nil)
     end
 
     test "the two families never share an id" do
@@ -299,14 +307,19 @@ defmodule LoggerDashboard.Logs.FilterTest do
       # precisely because "1h" appears in both: as a lookback it is the last
       # hour, as an age it is everything older than an hour ago.
       assert window_ids -- age_ids == ["10m", "24h"]
-      assert age_ids -- window_ids == ["12h", "1d", "3d", "30d", "90d"]
+      assert age_ids -- window_ids == ["12h", "1d", "3d", "30d", "90d", "all"]
     end
 
     test "each family is ordered shortest-first" do
       # The prune page renders the list in order, so an unsorted family would
-      # present "90d" before "1h".
+      # present "90d" before "1h". The timeless "all" entry carries no duration
+      # and always sorts last by construction.
       for family <- [:window, :age] do
-        durations = for {_id, {amount, unit}} <- Filter.presets(family), do: {amount, unit}
+        durations =
+          for {_id, duration} <- Filter.presets(family),
+              match?({_, _}, duration),
+              do: duration
+
         units = Enum.map(durations, &elem(&1, 1))
 
         assert durations ==
@@ -336,12 +349,23 @@ defmodule LoggerDashboard.Logs.FilterTest do
     end
 
     test "an age preset anchors only the upper bound and leaves the lower open" do
-      for {id, {amount, unit}} <- Filter.presets(:age) do
+      for {id, duration} <- Filter.presets(:age),
+          match?({_, _}, duration),
+          {amount, unit} = duration do
         preset = Filter.preset_id(:age, id)
 
         assert {:ok, {nil, to}} = Filter.resolve_preset(preset, @now)
         assert to == DateTime.add(@now, -amount, unit)
       end
+    end
+
+    test "the all-time preset resolves to no bounds while keeping its identity" do
+      assert {:ok, {nil, nil}} = Filter.resolve_preset("age:all", @now)
+
+      assert {:ok, filter} = Filter.parse(%{"preset" => "age:all"})
+      assert filter.from == nil
+      assert filter.to == nil
+      assert filter.preset == "age:all"
     end
 
     test "the same duration in different families resolves to different ranges" do

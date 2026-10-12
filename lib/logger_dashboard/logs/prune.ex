@@ -59,10 +59,15 @@ defmodule LoggerDashboard.Logs.Prune do
     end
   end
 
-  # A prune bounded by neither end would delete every row in scope. There is
-  # deliberately no override: an operator who wants that can pass an
-  # arbitrarily wide range, but omitting the bound is never the way to get it.
-  defp require_bounds(%Filter{from: nil, to: nil}), do: {:error, @unbounded_error}
+  # A prune bounded by neither end would delete every row in scope. The only
+  # override is the explicit All-time mark: bounds cleared by hand carry no
+  # mark and stay rejected, so an unbounded delete is always chosen on
+  # purpose, never reached by omission. An operator who wants a wide-but-bound
+  # range can still pass arbitrarily wide bounds.
+  defp require_bounds(%Filter{from: nil, to: nil, preset: preset}) do
+    if Filter.all_time?(preset), do: :ok, else: {:error, @unbounded_error}
+  end
+
   defp require_bounds(%Filter{}), do: :ok
 
   @doc "Describe the resolved predicate for confirmation."
@@ -76,11 +81,22 @@ defmodule LoggerDashboard.Logs.Prune do
 
     parts =
       [scope_text] ++
-        if(filter.from, do: ["from #{filter.from}"], else: []) ++
-        if(filter.to, do: ["to #{filter.to}"], else: []) ++
+        time_parts(filter) ++
         if(filter.levels == [], do: [], else: ["level #{Enum.join(filter.levels, ", ")}"])
 
     Enum.join(parts, ", ")
+  end
+
+  # An explicitly unbounded scope states its blast radius in words: with no
+  # bounds there is no cutoff to name, so the confirmation must say every row
+  # in scope goes, rather than listing a scope that reads as bounded.
+  defp time_parts(%Filter{} = filter) do
+    if Filter.all_time?(filter.preset) do
+      ["all time (every row in scope, no time bound)"]
+    else
+      if(filter.from, do: ["from #{filter.from}"], else: []) ++
+        if(filter.to, do: ["to #{filter.to}"], else: [])
+    end
   end
 
   @doc """

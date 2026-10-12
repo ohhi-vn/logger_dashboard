@@ -71,10 +71,14 @@ defmodule LoggerDashboard.Retention.Policy do
 
   Delegated to `Filter` so the prune page's age shortcuts and the retained age
   are the same vocabulary. A named duration means one cutoff regardless of which
-  surface applied it.
+  surface applied it. Retention needs a real cutoff to schedule against, so the
+  timeless all-time entry (prune UI only) is excluded: a policy that keeps
+  "everything forever" is the disabled policy, not a named age.
   """
   @spec keep_options() :: [{String.t(), {pos_integer(), System.time_unit()}}]
-  def keep_options, do: Filter.presets(:age)
+  def keep_options do
+    Enum.filter(Filter.presets(:age), fn {_id, duration} -> match?({_, _}, duration) end)
+  end
 
   @doc """
   The retained-age ids, as `{id, label}` pairs for a select control.

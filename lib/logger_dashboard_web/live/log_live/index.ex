@@ -27,7 +27,7 @@ defmodule LoggerDashboardWeb.LogLive.Index do
       |> assign(:has_next, false)
       |> assign(:limit, Filter.default_limit())
       |> assign(:offset, 0)
-      |> assign(:expanded_id, nil)
+      |> assign(:expanded_ids, MapSet.new())
       |> assign(:page_rows, [])
       |> assign(:node_options, [])
       |> stream_configure(:logs, dom_id: &row_dom_id/1)
@@ -40,55 +40,76 @@ defmodule LoggerDashboardWeb.LogLive.Index do
   def handle_params(params, _uri, socket) do
     filter_params = Map.take(params, @filter_keys)
 
-    socket =
-      case Filter.parse(filter_params) do
-        {:ok, filter} ->
-          socket
-          |> assign(:filter_params, filter_params)
-          # Built from the parsed filter, not the raw params, so the inputs show
-          # the values that were actually applied — including the instants a
-          # `preset` resolved to, and levels normalized during parse. The level
-          # value is the parsed set as a list so the multi-select marks it.
-          |> assign(:form, to_form(form_params(filter), as: :filters))
-          |> assign(:filter, filter)
-          |> assign(:filter_error, nil)
-          |> assign(:limit, filter.limit)
-          |> assign(:offset, filter.offset)
-          |> assign(:limit_options, Filter.limit_options(filter.limit))
-          |> load_logs(filter)
-          |> load_node_options()
+    {:noreply, apply_filter_params(socket, filter_params)}
+  end
 
-        {:error, message} ->
-          socket
-          |> assign(:filter_params, filter_params)
-          |> assign(:form, to_form(filter_params, as: :filters))
-          |> assign(:filter_error, message)
-          |> assign(:logs_error, nil)
-          # A request the system rejected computed nothing, so it carries no
-          # total. Leaving the previous number up would describe a filter set
-          # that is no longer active.
-          |> assign(:total, nil)
-          |> assign(:has_next, false)
-          |> assign(:page_rows, [])
-          |> assign(:node_options, [])
-          |> assign(:limit_options, limit_options(filter_params))
-          |> stream(:logs, [], reset: true)
-      end
+  # The single path that turns URL params into page state, shared by
+  # `handle_params` and the manual `refresh` event so both describe the same
+  # filter set. Expansion is page-local, so any new filter set starts
+  # collapsed.
+  defp apply_filter_params(socket, filter_params) do
+    socket = assign(socket, :expanded_ids, MapSet.new())
 
-    {:noreply, socket}
+    case Filter.parse(filter_params) do
+      {:ok, filter} ->
+        socket
+        |> assign(:filter_params, filter_params)
+        # Built from the parsed filter, not the raw params, so the inputs show
+        # the values that were actually applied — including the instants a
+        # `preset` resolved to, and levels normalized during parse. The level
+        # value is the parsed set as a list so the multi-select marks it.
+        |> assign(:form, to_form(form_params(filter), as: :filters))
+        |> assign(:filter, filter)
+        |> assign(:filter_error, nil)
+        |> assign(:limit, filter.limit)
+        |> assign(:offset, filter.offset)
+        |> assign(:limit_options, Filter.limit_options(filter.limit))
+        |> load_logs(filter)
+        |> load_node_options()
+
+      {:error, message} ->
+        socket
+        |> assign(:filter_params, filter_params)
+        |> assign(:form, to_form(filter_params, as: :filters))
+        |> assign(:filter_error, message)
+        |> assign(:logs_error, nil)
+        # A request the system rejected computed nothing, so it carries no
+        # total. Leaving the previous number up would describe a filter set
+        # that is no longer active.
+        |> assign(:total, nil)
+        |> assign(:has_next, false)
+        |> assign(:page_rows, [])
+        |> assign(:node_options, [])
+        |> assign(:limit_options, limit_options(filter_params))
+        |> stream(:logs, [], reset: true)
+    end
   end
 
   @impl true
   def handle_event("filter", params, socket) do
+    # The form no longer carries node or level inputs — those toggle through
+    # badge buttons — so a commit merges the submitted values over the URL
+    # params: the node/level scope survives a search or bound edit instead of
+    # being silently dropped. The page position never survives: a commit always
+    # restarts from the first page of the new filter set.
     params =
-      params
-      |> normalize_filter_params()
+      socket.assigns.filter_params
+      |> Map.delete("offset")
+      |> Map.merge(normalize_filter_params(params))
       # A submitted form carries a hand-entered bound, which always replaces a
       # shortcut. Dropping `preset` here is what stops a resolved window from
       # being re-applied over the value the operator just typed.
       |> Map.delete("preset")
 
     {:noreply, push_patch(socket, to: ~p"/logs?#{params}")}
+  end
+
+  @impl true
+  def handle_event("refresh", _params, socket) do
+    # Re-runs the filters already in the URL without changing them: same
+    # params through the same path `handle_params` uses, so Refresh shows the
+    # newest matching rows for exactly the scope on screen.
+    {:noreply, apply_filter_params(socket, socket.assigns.filter_params)}
   end
 
   @impl true
@@ -118,6 +139,16 @@ defmodule LoggerDashboardWeb.LogLive.Index do
   def handle_event("clear_nodes", _params, socket) do
     # Drop only the node scope; the other active filters are preserved so
     # clearing nodes does not silently widen a text or time window the user set.
+    params = Map.delete(socket.assigns.filter_params, "node")
+    {:noreply, push_patch(socket, to: ~p"/logs?#{params}")}
+  end
+
+  @impl true
+  def handle_event("select-all-nodes", _params, socket) do
+    # Whole-system scope is the empty node set (which also includes rows with
+    # no node), so select-all clears the param exactly like `clear_nodes`
+    # rather than enumerating every known node into the URL. It is the
+    # discoverable counterpart of the clear action, placed with the options.
     params = Map.delete(socket.assigns.filter_params, "node")
     {:noreply, push_patch(socket, to: ~p"/logs?#{params}")}
   end
@@ -218,26 +249,19 @@ defmodule LoggerDashboardWeb.LogLive.Index do
 
   @impl true
   def handle_event("toggle-expand", %{"id" => dom_id}, socket) do
-    # A single expanded row: vertical space is the scarce resource in this
-    # view, so opening one closes whichever was open. The toggle changes
-    # nothing else — no query, no patch — so the page's filters, its position,
-    # and its rows are untouched.
+    # Multi-open expansion: toggling a row only affects that row, and never a
+    # query or a patch, so the page's filters, its position, and its rows are
+    # untouched. The panel lives inside the streamed row, which is only
+    # re-rendered when re-inserted, so the toggled row is re-inserted at the
+    # index it already holds.
     rows = socket.assigns.page_rows
 
     with {:ok, index, log} <- find_row(rows, dom_id) do
-      previous_id = socket.assigns.expanded_id
-      expanded_id = if previous_id == dom_id, do: nil, else: dom_id
+      expanded_ids = toggle_member(socket.assigns.expanded_ids, dom_id)
 
-      # The panel and the toggle's own state live inside the streamed rows, and
-      # a streamed item is only re-rendered when it is re-inserted, so the
-      # toggled row is re-inserted at the index it already holds — along with
-      # the previously expanded row when the toggle moves between rows, which
-      # is what collapses it. Flipping the assign alone would leave its panel
-      # on screen.
       socket =
         socket
-        |> assign(:expanded_id, expanded_id)
-        |> collapse_previous(rows, previous_id, expanded_id)
+        |> assign(:expanded_ids, expanded_ids)
         |> stream_insert(:logs, log, at: index)
 
       {:noreply, socket}
@@ -246,6 +270,36 @@ defmodule LoggerDashboardWeb.LogLive.Index do
       # click. There is nothing to expand, and nothing to report.
       _ -> {:noreply, socket}
     end
+  end
+
+  @impl true
+  def handle_event("expand-all", _params, socket) do
+    # Every row on the current page only: expansion never reaches across pages.
+    # Each row is re-inserted at its own index so its panel renders; the page
+    # rows themselves are unchanged, so export and copy agree with the screen.
+    rows = socket.assigns.page_rows
+    expanded_ids = MapSet.new(rows, &row_dom_id/1)
+
+    socket =
+      rows
+      |> Enum.with_index()
+      |> Enum.reduce(assign(socket, :expanded_ids, expanded_ids), fn {log, index}, acc ->
+        stream_insert(acc, :logs, log, at: index)
+      end)
+
+    {:noreply, socket}
+  end
+
+  @impl true
+  def handle_event("collapse-all", _params, socket) do
+    # Clearing the set collapses every panel; re-streaming the page rows
+    # re-renders each row collapsed without touching filters or position.
+    socket =
+      socket
+      |> assign(:expanded_ids, MapSet.new())
+      |> stream(:logs, socket.assigns.page_rows, reset: true)
+
+    {:noreply, socket}
   end
 
   @impl true
@@ -263,15 +317,8 @@ defmodule LoggerDashboardWeb.LogLive.Index do
      })}
   end
 
-  defp collapse_previous(socket, _rows, previous_id, expanded_id)
-       when previous_id in [nil, expanded_id],
-       do: socket
-
-  defp collapse_previous(socket, rows, previous_id, _expanded_id) do
-    case find_row(rows, previous_id) do
-      {:ok, index, log} -> stream_insert(socket, :logs, log, at: index)
-      {:error, :not_found} -> socket
-    end
+  defp toggle_member(set, value) do
+    if MapSet.member?(set, value), do: MapSet.delete(set, value), else: MapSet.put(set, value)
   end
 
   defp find_row(rows, dom_id) do
@@ -461,8 +508,10 @@ defmodule LoggerDashboardWeb.LogLive.Index do
 
       <%!-- Clickable node options, sourced from the table rather than the page,
             so every known node is offered even when the page shows a subset.
-            A click toggles the node through the same `node` param as the text
-            input, which stays as the fallback for unknown or off-list names. --%>
+            A click toggles the node through the same `node` param the page is
+            scoped by. There is no free-text node input: badges are the only
+            node selector. Select-all returns to whole-system scope, exactly
+            like clearing. --%>
       <div id="logs-node-options" class="flex flex-wrap items-center gap-2 text-sm">
         <span class="text-base-content/70">All nodes:</span>
         <button
@@ -484,25 +533,34 @@ defmodule LoggerDashboardWeb.LogLive.Index do
         >
           {node}
         </button>
+        <button
+          type="button"
+          id="logs-select-all-nodes"
+          phx-click="select-all-nodes"
+          hidden={@filter.nodes == []}
+          title="Return to whole-system scope"
+          class="badge cursor-pointer border badge-outline badge-ghost hover:badge-primary"
+        >
+          Select all
+        </button>
         <span :if={@node_options == []} class="text-xs text-base-content/50">
-          No known nodes — type one below.
+          No known nodes.
         </span>
       </div>
 
+      <%!-- Badge toggles, shortcuts, and selects apply immediately through the
+            URL; search and bounds commit on change (debounced, never per
+            keystroke) or on submit. Refresh re-runs the URL filters. There is
+            deliberately no Apply or Reset submit. --%>
       <.form
         for={@form}
         id="logs-filter-form"
         phx-submit="filter"
+        phx-change="filter"
+        phx-debounce="400"
         class="grid grid-cols-1 gap-3 rounded-xl border border-base-300 bg-base-100 p-4 md:grid-cols-6"
       >
-        <div class="md:col-span-2">
-          <.input
-            field={@form[:node]}
-            label="Nodes (comma-separated, blank = all)"
-            placeholder="my_app@10.0.0.5, my_app@10.0.0.6"
-          />
-        </div>
-        <div class="md:col-span-2">
+        <div class="md:col-span-4">
           <.input field={@form[:search]} label="Search (* wildcards)" placeholder="*timeout*" />
         </div>
         <.bound id="logs" bound={:from} field={@form[:from]} label="From (UTC)" />
@@ -540,8 +598,15 @@ defmodule LoggerDashboardWeb.LogLive.Index do
         </div>
         <div class="md:col-span-6 flex flex-wrap items-center justify-between gap-2">
           <div class="flex gap-2">
-            <.button>Apply filters</.button>
-            <.link navigate={~p"/logs"} class="btn btn-ghost">Reset</.link>
+            <button
+              type="button"
+              id="logs-refresh"
+              phx-click="refresh"
+              title="Re-run the current filters"
+              class="btn btn-primary btn-soft"
+            >
+              <.icon name="hero-arrow-path" class="size-4" /> Refresh
+            </button>
           </div>
           <.shortcuts
             id="logs-shortcuts"
@@ -695,20 +760,23 @@ defmodule LoggerDashboardWeb.LogLive.Index do
                 id={"logs-expand-#{dom_id}"}
                 phx-click="toggle-expand"
                 phx-value-id={dom_id}
-                aria-expanded={to_string(@expanded_id == dom_id)}
-                aria-controls={@expanded_id == dom_id && "logs-expanded-#{dom_id}"}
+                aria-expanded={to_string(MapSet.member?(@expanded_ids, dom_id))}
+                aria-controls={MapSet.member?(@expanded_ids, dom_id) && "logs-expanded-#{dom_id}"}
                 aria-label={"Expand #{LogLine.timestamp(log)}"}
                 class="btn btn-ghost btn-xs shrink-0 px-1 text-base-content/70"
               >
                 <.icon
                   name="hero-chevron-down"
-                  class={["size-3.5 transition-transform", @expanded_id == dom_id && "rotate-180"]}
+                  class={[
+                    "size-3.5 transition-transform",
+                    MapSet.member?(@expanded_ids, dom_id) && "rotate-180"
+                  ]}
                 />
               </button>
             </span>
 
             <div
-              :if={@expanded_id == dom_id}
+              :if={MapSet.member?(@expanded_ids, dom_id)}
               id={"logs-expanded-#{dom_id}"}
               class="col-span-full border-t border-dashed border-base-300 bg-base-200/40 py-1.5"
             >
@@ -739,6 +807,24 @@ defmodule LoggerDashboardWeb.LogLive.Index do
               offers. --%>
         <span class="text-sm text-base-content/70">Offset {@offset} · Limit {@limit}</span>
         <.button id="logs-next" phx-click="next" disabled={not @has_next}>Next</.button>
+        <button
+          type="button"
+          id="logs-expand-all"
+          phx-click="expand-all"
+          title="Expand every message on this page"
+          class="btn btn-ghost btn-sm"
+        >
+          Expand all
+        </button>
+        <button
+          type="button"
+          id="logs-collapse-all"
+          phx-click="collapse-all"
+          title="Collapse every expanded message"
+          class="btn btn-ghost btn-sm"
+        >
+          Collapse all
+        </button>
         <.button
           id="logs-export"
           phx-click="export"

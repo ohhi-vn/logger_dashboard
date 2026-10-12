@@ -75,10 +75,17 @@ defmodule LoggerDashboard.Retention.PolicyTest do
     end
 
     test "accepts every age preset as a retained age" do
-      for {id, _duration} <- Filter.presets(:age) do
+      for {id, _duration} <- Policy.keep_options() do
         assert {:ok, policy} = Policy.build(%{"keep" => id})
         assert policy.keep == id
       end
+    end
+
+    test "rejects the timeless all entry as a retained age" do
+      # Retention needs a real cutoff to schedule against; "keep everything" is
+      # the disabled policy, not a named age.
+      assert {:error, message} = Policy.build(%{"keep" => "all"})
+      assert message =~ "invalid retained age"
     end
 
     test "rejects a retained age outside the age family" do
@@ -225,10 +232,13 @@ defmodule LoggerDashboard.Retention.PolicyTest do
     test "labels every age option from its duration" do
       labels = Policy.keep_labels()
 
-      assert length(labels) == length(Filter.presets(:age))
+      assert length(labels) == length(Policy.keep_options())
 
       assert {"1h", "1h"} in labels
       assert {"7d", "7d"} in labels
+
+      # The timeless all-time entry is prune UI only, not a retained age.
+      refute Enum.any?(labels, fn {id, _label} -> id == "all" end)
     end
   end
 

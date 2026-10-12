@@ -22,9 +22,9 @@ defmodule LoggerDashboardWeb.PruneLive.Index do
     socket =
       socket
       |> assign(:page_title, "Prune logs")
-      |> assign(:prune_params, %{"scope" => "node"})
+      |> assign(:prune_params, %{"scope" => "all"})
       |> assign(:node_options, [])
-      |> assign(:form, to_form(%{"scope" => "node"}, as: :prune))
+      |> assign(:form, to_form(%{"scope" => "all"}, as: :prune))
       |> assign(:preview, nil)
       |> assign(:preview_filter, nil)
       |> assign(:preview_scope, nil)
@@ -50,10 +50,27 @@ defmodule LoggerDashboardWeb.PruneLive.Index do
 
   @impl true
   def handle_params(params, _uri, socket) do
+    # The page opens in whole-system scope when no scope param is present.
+    # This default lives in page state only: `Prune.parse/1` still rejects a
+    # request with an absent scope, so nothing here widens what a delete
+    # accepts.
     prune_params =
       params
       |> Map.take(@prune_keys)
-      |> Map.put_new("scope", "node")
+      |> Map.put_new("scope", "all")
+
+    {:noreply, apply_prune_params(socket, prune_params)}
+  end
+
+  # The single path that turns URL params into page state. Any param change
+  # clears a pending preview, so a stale count can never be confirmed for a
+  # different scope, and previewing or deleting stays behind explicit actions.
+  defp apply_prune_params(socket, prune_params) do
+    # The level select always shows a value: an absent level means "all", so
+    # the form displays it rather than rendering with nothing selected. This
+    # only affects display and what the form submits — `Prune.parse/1` treats
+    # an explicit `all` exactly like an absent level.
+    form_base = Map.put_new(prune_params, "level", "all")
 
     case Filter.resolve_preset(prune_params["preset"], DateTime.utc_now()) do
       {:ok, {_from, resolved_to}} ->
@@ -61,28 +78,39 @@ defmodule LoggerDashboardWeb.PruneLive.Index do
         # confirms a concrete instant rather than a label.
         form_params =
           if resolved_to,
-            do: Map.put(prune_params, "to", iso_second(resolved_to)),
-            else: prune_params
+            do: Map.put(form_base, "to", iso_second(resolved_to)),
+            else: form_base
 
-        {:noreply,
-         socket
-         |> assign(:prune_params, prune_params)
-         |> assign(:form, to_form(form_params, as: :prune))
-         |> assign(:error, nil)
-         |> load_node_options()
-         |> clear_preview()}
+        socket
+        |> assign(:prune_params, prune_params)
+        |> assign(:form, to_form(form_params, as: :prune))
+        |> assign(:error, nil)
+        |> load_node_options()
+        |> clear_preview()
 
       {:error, message} ->
         # An unrecognized cutoff is rejected outright, and no delete is
         # reachable from a request that carries one.
-        {:noreply,
-         socket
-         |> assign(:prune_params, prune_params)
-         |> assign(:form, to_form(prune_params, as: :prune))
-         |> assign(:node_options, [])
-         |> assign(:error, message)
-         |> clear_preview()}
+        socket
+        |> assign(:prune_params, prune_params)
+        |> assign(:form, to_form(form_base, as: :prune))
+        |> assign(:node_options, [])
+        |> assign(:error, message)
+        |> clear_preview()
     end
+  end
+
+  @impl true
+  def handle_event("select-all-nodes", _params, socket) do
+    # Whole-system scope keeping the datetime range and level: the operator
+    # narrows the blast radius back to everything only, and still has to
+    # preview and confirm before anything is deleted.
+    params =
+      socket.assigns.prune_params
+      |> Map.put("scope", "all")
+      |> Map.delete("node")
+
+    {:noreply, push_patch(socket, to: ~p"/prune?#{params}")}
   end
 
   @impl true
@@ -137,7 +165,20 @@ defmodule LoggerDashboardWeb.PruneLive.Index do
 
   @impl true
   def handle_event("preview", params, socket) do
-    attrs = prune_attrs(params)
+    # The form carries no node field — badges own the scope — so the submitted
+    # values merge over the URL params: the badge-selected node survives an
+    # explicit preview instead of being dropped, while anything the form does
+    # carry (bounds, level) wins. `preset` never reaches the parse, so
+    # an edited cutoff is used as typed rather than re-resolved — except the
+    # All-time mark, which survives only when the form carries no explicit
+    # bound, so typing a bound after All time yields a bounded prune while
+    # hand-cleared bounds with no mark stay rejected downstream.
+    form_attrs = prune_attrs(params)
+
+    attrs =
+      socket.assigns.prune_params
+      |> Map.merge(form_attrs)
+      |> drop_preset_unless_all_time(form_attrs)
 
     case Prune.parse(attrs) do
       {:ok, filter, scope} ->
@@ -361,6 +402,22 @@ defmodule LoggerDashboardWeb.PruneLive.Index do
 
   defp prune_attrs(attrs) when is_map(attrs), do: Map.drop(attrs, ["preset"])
 
+  # The All-time mark is the one preset allowed through to the parse, and only
+  # when the submitted form carries no explicit bound: with a typed bound the
+  # mark is dropped so the bound wins (as with age shortcuts), and without the
+  # mark hand-cleared bounds stay rejected in `Prune.parse/1`.
+  defp drop_preset_unless_all_time(params, form_attrs) do
+    if Filter.all_time?(params["preset"]) and blank_bound?(form_attrs["from"]) and
+         blank_bound?(form_attrs["to"]) do
+      params
+    else
+      Map.delete(params, "preset")
+    end
+  end
+
+  defp blank_bound?(nil), do: true
+  defp blank_bound?(value), do: String.trim(to_string(value)) == ""
+
   defp clear_preview(socket) do
     socket
     |> assign(:preview, nil)
@@ -417,10 +474,12 @@ defmodule LoggerDashboardWeb.PruneLive.Index do
         </div>
 
         <%!-- Clickable node options, sourced from the table rather than the
-              scope in view. A click selects the single-node scope for that
-              value — replacing whatever the input holds — and then stops: the
-              text input stays as the fallback, and deleting still requires an
-              explicit preview and confirm. --%>
+              scope in view. Badges are the only node selector: there is no
+              free-text node input. A click selects the single-node scope for
+              that value — replacing the current scope — and then stops:
+              deleting still requires an explicit preview and confirm.
+              Select-all returns to whole-system scope keeping range and
+              level. --%>
         <div id="prune-node-options" class="flex flex-wrap items-center gap-2 text-sm">
           <span class="text-base-content/70">Nodes:</span>
           <button
@@ -443,10 +502,33 @@ defmodule LoggerDashboardWeb.PruneLive.Index do
           >
             {node}
           </button>
+          <button
+            type="button"
+            id="prune-select-all-nodes"
+            phx-click="select-all-nodes"
+            title="Return to whole-system scope, keeping range and level (still requires preview and confirm)"
+            class="badge cursor-pointer border badge-outline badge-ghost hover:badge-primary"
+          >
+            Select all
+          </button>
           <span :if={@node_options == []} class="text-xs text-base-content/50">
-            No known nodes — type one below.
+            No known nodes.
           </span>
         </div>
+
+        <%!-- The scope in effect, stated rather than implied: a badge click or
+              shortcut lands here, including a node no badge offers, so the
+              confirmation below is never the first place the scope appears. --%>
+        <p id="prune-active-scope" class="text-sm text-base-content/70">
+          <%= if @prune_params["scope"] == "node" do %>
+            Single node:
+            <span class="badge badge-outline badge-primary" data-node={@prune_params["node"]}>
+              {@prune_params["node"]}
+            </span>
+          <% else %>
+            Whole system (all nodes)
+          <% end %>
+        </p>
 
         <%!-- Clickable single-select levels through the same `level` param the
               form submits. --%>
@@ -482,17 +564,9 @@ defmodule LoggerDashboardWeb.PruneLive.Index do
           phx-submit="preview"
           class="grid grid-cols-1 gap-3 rounded-xl border border-base-300 bg-base-100 p-4 md:grid-cols-2"
         >
-          <.input
-            field={@form[:scope]}
-            label="Scope"
-            type="select"
-            options={[{"Single node", "node"}, {"Whole system", "all"}]}
-          />
-          <.input
-            field={@form[:node]}
-            label="Single node (one node only, required for single-node scope)"
-            placeholder="my_app@10.0.0.5"
-          />
+          <%!-- No scope control: the scope lives in the request params, set
+                only by the node badges (single node) and Select all (whole
+                system), and shown in the active-scope line above. --%>
           <.bound id="prune" bound={:from} field={@form[:from]} label="From (UTC)" />
           <.bound id="prune" bound={:to} field={@form[:to]} label="To (UTC)" />
           <.input
@@ -506,13 +580,12 @@ defmodule LoggerDashboardWeb.PruneLive.Index do
               id="prune-shortcuts"
               family={:age}
               active={@prune_params["preset"]}
-              label="Delete logs older than"
+              label="Time range"
             />
           </div>
           <div class="md:col-span-2">
-            <div class="flex gap-2">
+            <div class="flex flex-wrap gap-2">
               <.button>Preview prune</.button>
-              <.link navigate={~p"/prune"} class="btn btn-ghost">Reset</.link>
             </div>
           </div>
         </.form>

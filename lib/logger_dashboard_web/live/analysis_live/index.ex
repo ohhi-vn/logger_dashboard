@@ -33,6 +33,14 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
   @impl true
   def handle_params(params, _uri, socket) do
     filter_params = Map.take(params, @filter_keys)
+
+    {:noreply, apply_analysis_params(socket, filter_params)}
+  end
+
+  # The single path that turns URL params into page state, shared by
+  # `handle_params` and the manual `refresh` event so both describe the same
+  # scope.
+  defp apply_analysis_params(socket, filter_params) do
     nodes_selected = selected_nodes(filter_params)
     levels_selected = selected_levels(filter_params)
 
@@ -42,7 +50,7 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
     # is merged in here. Without it the select would carry no value at all, and
     # a select with nothing selected displays its first option, which would show
     # `hour` over results that were computed by day.
-    bucket = Analysis.normalize_bucket(Map.get(params, "bucket"))
+    bucket = Analysis.normalize_bucket(Map.get(filter_params, "bucket"))
 
     socket =
       socket
@@ -50,35 +58,46 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
       |> assign(:nodes_selected, nodes_selected)
       |> assign(:levels_selected, levels_selected)
 
-    socket =
-      case Filter.parse(Map.put(filter_params, "limit", "50")) do
-        {:ok, filter} ->
-          socket
-          |> assign(:filter_error, nil)
-          # Built from the parsed filter so the inputs show the values actually
-          # applied, including the instants a `preset` resolved to.
-          |> assign(:form, to_form(form_params(filter, bucket), as: :filters))
-          |> load_analysis(filter, bucket)
-          |> load_node_options()
+    case Filter.parse(Map.put(filter_params, "limit", "50")) do
+      {:ok, filter} ->
+        socket
+        |> assign(:filter_error, nil)
+        # Built from the parsed filter so the inputs show the values actually
+        # applied, including the instants a `preset` resolved to.
+        |> assign(:form, to_form(form_params(filter, bucket), as: :filters))
+        |> load_analysis(filter, bucket)
+        |> load_node_options()
 
-        {:error, message} ->
-          socket
-          |> assign(:form, to_form(filter_params, as: :filters))
-          |> assign(:node_options, [])
-          # Assigned last, so clearing the results cannot take the rejection
-          # with it.
-          |> clear_results()
-          |> assign(:filter_error, message)
-      end
-
-    {:noreply, socket}
+      {:error, message} ->
+        socket
+        |> assign(:form, to_form(filter_params, as: :filters))
+        |> assign(:node_options, [])
+        # Assigned last, so clearing the results cannot take the rejection
+        # with it.
+        |> clear_results()
+        |> assign(:filter_error, message)
+    end
   end
 
   @impl true
   def handle_event("filter", params, socket) do
-    # A submitted form carries hand-entered bounds, which always replace a
-    # shortcut, so the submitted params carry no `preset`.
-    {:noreply, push_patch(socket, to: ~p"/analysis?#{allowed_filters(params)}")}
+    # The form no longer carries a node input — badges toggle the scope — so a
+    # commit merges the submitted values over the URL params instead of
+    # silently dropping the node scope. A submitted form carries hand-entered
+    # bounds, which always replace a shortcut: `preset` is dropped after the
+    # merge so a resolved window is never re-applied over typed values.
+    params =
+      socket.assigns.filter_params
+      |> Map.merge(allowed_filters(params))
+      |> Map.delete("preset")
+
+    {:noreply, push_patch(socket, to: ~p"/analysis?#{params}")}
+  end
+
+  @impl true
+  def handle_event("refresh", _params, socket) do
+    # Recomputes the scope already in the URL without changing it.
+    {:noreply, apply_analysis_params(socket, socket.assigns.filter_params)}
   end
 
   @impl true
@@ -104,6 +123,14 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
   def handle_event("clear_nodes", _params, socket) do
     # Drop only the node scope; range and level are preserved so clearing
     # nodes does not widen the window the user chose.
+    params = Map.delete(socket.assigns.filter_params, "node")
+    {:noreply, push_patch(socket, to: ~p"/analysis?#{params}")}
+  end
+
+  @impl true
+  def handle_event("select-all-nodes", _params, socket) do
+    # Whole-system scope is the empty node set, so select-all clears the param
+    # exactly like `clear_nodes` rather than enumerating every known node.
     params = Map.delete(socket.assigns.filter_params, "node")
     {:noreply, push_patch(socket, to: ~p"/analysis?#{params}")}
   end
@@ -360,8 +387,8 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
       </div>
 
       <%!-- Clickable node options, sourced from the table rather than the page.
-            A click toggles the node through the same `node` param as the text
-            input, which stays as the fallback for unknown or off-list names. --%>
+            Badges are the only node selector: there is no free-text node
+            input. Select-all returns to whole-system scope, like clearing. --%>
       <div id="analysis-node-options" class="flex flex-wrap items-center gap-2 text-sm">
         <span class="text-base-content/70">All nodes:</span>
         <button
@@ -383,25 +410,34 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
         >
           {node}
         </button>
+        <button
+          type="button"
+          id="analysis-select-all-nodes"
+          phx-click="select-all-nodes"
+          hidden={@nodes_selected == []}
+          title="Return to whole-system scope"
+          class="badge cursor-pointer border badge-outline badge-ghost hover:badge-primary"
+        >
+          Select all
+        </button>
         <span :if={@node_options == []} class="text-xs text-base-content/50">
-          No known nodes — type one below.
+          No known nodes.
         </span>
       </div>
 
+      <%!-- Badge toggles, shortcuts, bucket, and selects apply immediately
+            through the URL; search and bounds commit on change (debounced,
+            never per keystroke) or on submit. Refresh recomputes the URL
+            scope. There is deliberately no Run or Reset submit. --%>
       <.form
         for={@form}
         id="analysis-filter-form"
         phx-submit="filter"
+        phx-change="filter"
+        phx-debounce="400"
         class="grid grid-cols-1 gap-3 rounded-xl border border-base-300 bg-base-100 p-4 md:grid-cols-6"
       >
-        <div class="md:col-span-2">
-          <.input
-            field={@form[:node]}
-            label="Nodes (comma-separated, blank = all)"
-            placeholder="my_app@10.0.0.5, my_app@10.0.0.6"
-          />
-        </div>
-        <div class="md:col-span-2">
+        <div class="md:col-span-4">
           <.input
             field={@form[:search]}
             label="Search (* wildcards)"
@@ -443,8 +479,15 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
         </div>
         <div class="md:col-span-6 flex flex-wrap items-center justify-between gap-2">
           <div class="flex gap-2">
-            <.button>Run analysis</.button>
-            <.link navigate={~p"/analysis"} class="btn btn-ghost">Reset</.link>
+            <button
+              type="button"
+              id="analysis-refresh"
+              phx-click="refresh"
+              title="Recompute the current scope"
+              class="btn btn-primary btn-soft"
+            >
+              <.icon name="hero-arrow-path" class="size-4" /> Refresh
+            </button>
           </div>
           <.shortcuts
             id="analysis-shortcuts"

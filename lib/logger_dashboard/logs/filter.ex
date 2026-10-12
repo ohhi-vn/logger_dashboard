@@ -37,7 +37,8 @@ defmodule LoggerDashboard.Logs.Filter do
   #
   # A `window` preset is a lookback that ends now, so it sets both bounds. An
   # `age` preset is a retention cutoff, so it sets only `to` and leaves `from`
-  # open. The families are kept separate rather than merged into one vocabulary
+  # open — except the timeless `all` entry, which sets neither. The families
+  # are kept separate rather than merged into one vocabulary
   # because both readings want a "7d": "last 7 days" and "older than 7 days" are
   # different ranges, so a bare `7d` would be ambiguous. Preset ids are
   # therefore namespaced as `"<family>:<id>"` — see `preset_id/2`.
@@ -47,6 +48,11 @@ defmodule LoggerDashboard.Logs.Filter do
   # retention policy is specified in the same units. Both surfaces read this one
   # list, so a named duration resolves to the same cutoff wherever it is applied;
   # a second vocabulary for retention would let the two drift apart.
+  #
+  # `age` ends with a timeless `all` entry rather than a duration: "All time"
+  # resolves to no bounds at all (`{nil, nil}`) while keeping its preset
+  # identity, which is what lets a delete distinguish an explicitly unbounded
+  # scope from bounds the operator merely left empty.
   @presets %{
     "window" => [
       {"10m", {10, :minute}},
@@ -63,7 +69,8 @@ defmodule LoggerDashboard.Logs.Filter do
       {"3d", {3, :day}},
       {"7d", {7, :day}},
       {"30d", {30, :day}},
-      {"90d", {90, :day}}
+      {"90d", {90, :day}},
+      {"all", :all_time}
     ]
   }
 
@@ -112,13 +119,18 @@ defmodule LoggerDashboard.Logs.Filter do
   end
 
   @doc """
-  The ordered `{"id", {amount, unit}}` list of relative shortcuts in `family`.
+  The ordered `{"id", duration}` list of relative shortcuts in `family`.
+
+  A duration is `{amount, unit}` except for the timeless `all` entry, which is
+  the atom `:all_time` and resolves to no bounds.
 
   The viewer and Analysis page offer `:window`; the prune page offers `:age`.
   The web layer renders a button per entry so the shortcut vocabulary has a
   single owner here rather than being restated in a template.
   """
-  @spec presets(:window | :age) :: [{String.t(), {pos_integer(), System.time_unit()}}]
+  @spec presets(:window | :age) :: [
+          {String.t(), {pos_integer(), System.time_unit()} | :all_time}
+        ]
   def presets(family) when family in [:window, :age],
     do: Map.fetch!(@presets, Atom.to_string(family))
 
@@ -126,6 +138,13 @@ defmodule LoggerDashboard.Logs.Filter do
   @spec preset_id(:window | :age, String.t()) :: String.t()
   def preset_id(family, id) when family in [:window, :age],
     do: "#{family}:#{id}"
+
+  @doc """
+  Whether a `preset` param value is the explicit all-time mark: a scope with
+  no bounds that the operator chose on purpose, rather than bounds left empty.
+  """
+  @spec all_time?(String.t() | nil) :: boolean()
+  def all_time?(preset), do: preset == preset_id(:age, "all")
 
   @doc """
   Resolve a `preset` param into concrete `{from, to}` bounds against `now`.
@@ -137,7 +156,8 @@ defmodule LoggerDashboard.Logs.Filter do
   shortcut always describes a window ending now: a bookmarked "last hour" link
   would otherwise pin the instant it was created. A `window` preset resolves to
   `{now - duration, now}`; an `age` preset resolves to `{nil, now - duration}`,
-  leaving the open end unbounded. An absent or blank preset resolves to
+  leaving the open end unbounded; the timeless `all` age entry resolves to
+  `{nil, nil}` while keeping its preset identity. An absent or blank preset resolves to
   `{nil, nil}`, meaning "no range" rather than "an empty one".
   """
   @spec resolve_preset(String.t() | nil, DateTime.t()) ::
@@ -163,10 +183,17 @@ defmodule LoggerDashboard.Logs.Filter do
 
   defp resolve_family_preset(family, id, now) do
     with true <- is_map_key(@presets, family),
-         {_, {amount, unit}} <- List.keyfind(Map.fetch!(@presets, family), id, 0) do
-      cutoff = DateTime.add(now, -amount, unit)
+         {_, duration} <- List.keyfind(Map.fetch!(@presets, family), id, 0) do
+      case {family, duration} do
+        {_family, :all_time} ->
+          {:ok, {nil, nil}}
 
-      if family == "window", do: {:ok, {cutoff, now}}, else: {:ok, {nil, cutoff}}
+        {"window", {amount, unit}} ->
+          {:ok, {DateTime.add(now, -amount, unit), now}}
+
+        {"age", {amount, unit}} ->
+          {:ok, {nil, DateTime.add(now, -amount, unit)}}
+      end
     else
       _ -> {:error, unknown_preset_error("#{family}:#{id}")}
     end
