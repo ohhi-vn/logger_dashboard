@@ -222,6 +222,26 @@ defmodule LoggerDashboard.Logs.AnalysisTest do
       end
     end
 
+    test "a keyword matches without regard to case", %{node: node} do
+      # The rows read "boom"; the search says "BOOM". The case-insensitive
+      # comparison is what makes the keyword path find them.
+      assert {:ok, filter} = Filter.parse(%{"node" => node, "search" => "*BOOM*"})
+      assert {:ok, result} = Analysis.level_frequency(filter, limit: 100)
+
+      assert result.labels == ["error"]
+      assert hd(result.series).data == [2]
+    end
+
+    test "several keyword terms narrow the breakdown to rows matching all of them", %{node: node} do
+      # "boom one" matches both terms; "boom two" and "all good" match one each.
+      # A row therefore has to match every term, not any of them.
+      assert {:ok, filter} = Filter.parse(%{"node" => node, "search" => "*boom* *one*"})
+      assert {:ok, result} = Analysis.level_frequency(filter, limit: 100)
+
+      assert result.labels == ["error"]
+      assert hd(result.series).data == [1]
+    end
+
     test "a keyword scope matching nothing renders empty results", %{node: node} do
       assert {:ok, filter} =
                Filter.parse(%{"node" => node, "search" => "*no such text at all*"})
@@ -305,6 +325,38 @@ defmodule LoggerDashboard.Logs.AnalysisTest do
 
     assert {:ok, result} = Analysis.node_frequency(filter, limit: 1_000)
     assert result.labels == [other]
+  end
+
+  describe "chart style labels" do
+    test "every style a breakdown can be drawn in has a readable name" do
+      for breakdown <- [:level, :volume, :node] do
+        for style <- Analysis.chart_styles(breakdown) do
+          label = Analysis.chart_style_label(style)
+
+          assert is_binary(label)
+          assert label != ""
+          # The label is a word an operator reads, not the machine name.
+          assert label == String.capitalize(label)
+        end
+      end
+    end
+
+    test "the label names the style it describes" do
+      assert Analysis.chart_style_label(:bar) == "Bar"
+      assert Analysis.chart_style_label(:pie) == "Pie"
+      assert Analysis.chart_style_label(:donut) == "Donut"
+      assert Analysis.chart_style_label(:line) == "Line"
+      assert Analysis.chart_style_label(:area) == "Area"
+    end
+
+    test "the style atoms are unchanged" do
+      # The machine name is what travels in the URL, so it must not drift when
+      # a label is added.
+      assert Analysis.chart_styles(:level) == [:bar, :pie, :donut]
+      assert Analysis.chart_styles(:volume) == [:bar, :line, :area]
+      assert Analysis.chart_styles(:node) == [:bar, :pie, :donut]
+      assert Analysis.default_chart_styles() == %{level: :bar, volume: :line, node: :bar}
+    end
   end
 
   test "applied_limit caps at max_limit" do

@@ -26,10 +26,118 @@ defmodule LoggerDashboard.Logs.Analysis do
   @buckets ~w(minute hour day week month)a
   @default_bucket :hour
 
+  # The chart styles each breakdown can be drawn in.
+  #
+  # The styles are a property of the breakdown's shape rather than of the data
+  # in view: a level or node breakdown is one series of counts, which reads as
+  # a bar, a pie, or a donut, while a volume breakdown is a series over time,
+  # which reads as a bar, a line, or an area. A pie of a multi-series result
+  # would misrepresent it, so the volume breakdown never offers one.
+  #
+  # The defaults are the styles `AshDyan.Charts.recommend/1` picks for these
+  # result types, so a page that asks for nothing gets the recommended chart.
+  @chart_styles %{
+    level: [:bar, :pie, :donut],
+    volume: [:bar, :line, :area],
+    node: [:bar, :pie, :donut]
+  }
+
+  @chart_defaults %{level: :bar, volume: :line, node: :bar}
+
+  # The readable name each chart style is shown under.
+  #
+  # The style itself travels in the URL as a machine name (`level_chart=pie`),
+  # so the label is presentation only: the map turns the machine name into the
+  # word an operator reads, and the machine name stays what is sent and what is
+  # stored.
+  #
+  # The compile-time check below keeps the map and the vocabulary in step: a
+  # style added to `@chart_styles` without a label is a compile error rather
+  # than a blank button.
+  @chart_style_labels %{
+    bar: "Bar",
+    pie: "Pie",
+    donut: "Donut",
+    line: "Line",
+    area: "Area"
+  }
+
+  # The URL param each breakdown's style travels in.
+  @chart_params %{level: "level_chart", volume: "volume_chart", node: "node_chart"}
+
   @unrecognized_response_format "ClickHouse returned an unrecognized response format for the analysis read."
+
+  # Every style a breakdown can be drawn in must have a readable name, and no
+  # readable name may describe a style that is not offered. Checked at compile
+  # time so the two cannot drift apart.
+  _ =
+    unless MapSet.new(Map.values(@chart_styles) |> List.flatten()) ==
+             MapSet.new(Map.keys(@chart_style_labels)) do
+      raise ArgumentError,
+            "chart style labels do not match the chart styles offered: " <>
+              "styles #{inspect(MapSet.new(Map.values(@chart_styles) |> List.flatten()))}, " <>
+              "labels #{inspect(MapSet.new(Map.keys(@chart_style_labels)))}"
+    end
 
   def buckets, do: @buckets
   def default_bucket, do: @default_bucket
+
+  @doc "The chart styles a breakdown can be drawn in."
+  @spec chart_styles(atom()) :: [atom()]
+  def chart_styles(breakdown), do: Map.fetch!(@chart_styles, breakdown)
+
+  @doc "The style a breakdown is drawn in when nothing else is asked for."
+  @spec default_chart_style(atom()) :: atom()
+  def default_chart_style(breakdown), do: Map.fetch!(@chart_defaults, breakdown)
+
+  @doc """
+  The readable name a chart style is shown under.
+
+  The style itself is a machine name that travels in the URL; this is the word
+  the control shows for it. Keeping the two apart means a link keeps working
+  whatever the label says.
+  """
+  @spec chart_style_label(atom()) :: String.t()
+  def chart_style_label(style), do: Map.fetch!(@chart_style_labels, style)
+
+  @doc "The default style of every breakdown."
+  @spec default_chart_styles() :: %{atom() => atom()}
+  def default_chart_styles, do: @chart_defaults
+
+  @doc "The URL param a breakdown's style travels in."
+  @spec chart_param(atom() | String.t()) :: String.t() | nil
+  def chart_param(breakdown) when is_atom(breakdown),
+    do: Map.get(@chart_params, breakdown)
+
+  def chart_param(breakdown) when is_binary(breakdown) do
+    Enum.find_value(@chart_params, fn {key, param} ->
+      if Atom.to_string(key) == breakdown, do: param
+    end)
+  end
+
+  @doc """
+  Resolve a chart style param onto one of the styles a breakdown can be drawn
+  in, falling back to that breakdown's default.
+
+  An unrecognized style — a stale link, a hand-edited URL, a style that
+  belongs to another breakdown — resolves to the default rather than
+  failing the request, so a page always draws a chart. The caller uses the
+  returned style for the query and for the control that displays it, and the
+  effective style is shown when the data cannot take the one that was asked
+  for.
+  """
+  @spec normalize_chart_style(atom(), String.t() | atom() | nil) :: atom()
+  def normalize_chart_style(breakdown, style) when is_binary(style) do
+    atom = String.to_existing_atom(style)
+
+    if atom in Map.fetch!(@chart_styles, breakdown),
+      do: atom,
+      else: default_chart_style(breakdown)
+  rescue
+    _ -> default_chart_style(breakdown)
+  end
+
+  def normalize_chart_style(breakdown, _style), do: default_chart_style(breakdown)
 
   @doc "Build AshDyan filters from a parsed viewer filter (no message)."
   @spec dyan_filters(Filter.t()) :: map()
@@ -214,7 +322,11 @@ defmodule LoggerDashboard.Logs.Analysis do
   # structure the AshDyan path produces, so ordering, chart rendering, empty
   # tables, and limit disclosure are unchanged between the two paths.
 
-  defp keyword?(%Filter{} = filter), do: Filter.to_like_pattern(filter.search) != nil
+  # A keyword scope is a search that carries at least one term. The terms are
+  # matched by `Filter.predicates/1`, so the keyword path and the viewer read
+  # messages with the same semantics: wildcards, no regard to case, and every
+  # term required.
+  defp keyword?(%Filter{} = filter), do: Filter.split_terms(filter.search) != []
 
   defp keyword_level_frequency(filter, limit) do
     {where, params} = Filter.predicates(filter)

@@ -35,10 +35,15 @@ defmodule LoggerDashboard.Retention.Scheduler do
 
   ## The schedule
 
-  Each occurrence is computed from the wall clock and the policy's run time, so
-  it is recomputed after every fire rather than slept toward. A fixed interval
-  would drift against the clock — and after a clock jump, would keep drifting.
+  Each occurrence is computed from the wall clock rather than slept toward, so a
+  slow run or a clock jump cannot leave the schedule permanently behind.
   Occurrences are resolved in UTC, matching every other time in this project.
+
+  How far out "next" is depends on the cadence `Policy` derives from the retained
+  age. An hour-valued age fires at the top of every hour — a daily schedule would
+  leave hour-old logs standing for up to a day past the age it names — while a
+  day-valued age keeps the once-a-day run at the policy's run time. That run time
+  governs only the day-valued cadence; the delete they dispatch is identical.
 
   ## The delete
 
@@ -183,10 +188,22 @@ defmodule LoggerDashboard.Retention.Scheduler do
 
   Pure, so the schedule is testable without waiting for a real clock. Always
   returns a strictly future instant: an occurrence at or before `now` is the one
-  just gone, and the next one is a day out.
+  just gone. How far out the next one is depends on the cadence the retained age
+  implies — the top of the next hour for an hour-valued age, the next day's run
+  time for a day-valued one.
   """
   @spec next_occurrence(Policy.t(), DateTime.t()) :: DateTime.t()
-  def next_occurrence(%Policy{run_at: {clock, _zone}} = _policy, %DateTime{} = now) do
+  def next_occurrence(%Policy{} = policy, %DateTime{} = now) do
+    case Policy.cadence(policy) do
+      :hourly -> hourly_occurrence(now)
+      :daily -> daily_occurrence(policy.run_at, now)
+    end
+  end
+
+  # A day-valued age runs once per day at the policy's time of day, the schedule
+  # this module has always had. The clock is re-resolved after every fire, so the
+  # arithmetic below answers "when is the next one", never "when was the last".
+  defp daily_occurrence({clock, _zone}, now) do
     {hour, minute} = split_clock(clock)
 
     today = %{now | hour: hour, minute: minute, second: 0, microsecond: {0, 0}}
@@ -195,6 +212,20 @@ defmodule LoggerDashboard.Retention.Scheduler do
       DateTime.add(today, 1, :day)
     else
       today
+    end
+  end
+
+  # An hour-valued age runs on the hour, whatever time of day the policy holds:
+  # the run time governs a day-valued age only. Zeroed minute/second land every
+  # occurrence on a boundary, so a slow run or a clock jump still reschedules to
+  # the next one rather than drifting off the hour.
+  defp hourly_occurrence(now) do
+    boundary = %{now | minute: 0, second: 0, microsecond: {0, 0}}
+
+    if DateTime.compare(boundary, now) != :gt do
+      DateTime.add(boundary, 1, :hour)
+    else
+      boundary
     end
   end
 

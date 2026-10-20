@@ -170,16 +170,53 @@ defmodule LoggerDashboard.Retention.Policy do
   end
 
   @doc """
+  The cadence a policy runs at, derived from its retained age's unit.
+
+  An hour-valued age runs every hour; a day-valued age runs once per day at the
+  policy's time. The cadence is derived rather than stored, so the schedule
+  cannot disagree with the age it enforces.
+  """
+  @spec cadence(t()) :: :hourly | :daily
+  def cadence(%__MODULE__{keep: keep}), do: keep_cadence(keep)
+
+  @doc """
+  The cadence a retained age runs at, from the id `keep_options/0` pairs with a
+  duration.
+
+  `:hour` is the only unit finer than a day the vocabulary offers, so it is the
+  only cadence split: a daily schedule would leave hour-old logs standing for
+  up to a day past the age it names. Any other unit — `:day` today, anything the
+  family might grow — keeps the once-a-day schedule rather than inventing a
+  cadence for a unit the vocabulary does not name.
+  """
+  @spec keep_cadence(String.t()) :: :hourly | :daily
+  def keep_cadence(keep) do
+    case List.keyfind(keep_options(), keep, 0) do
+      {_id, {_amount, :hour}} -> :hourly
+      _other -> :daily
+    end
+  end
+
+  @doc """
   Describe the policy in one line, for the confirmation and the run log.
 
   Names the scope explicitly because a system-wide unattended delete should
-  never be summarisable as just a duration.
+  never be summarisable as just a duration, and names the cadence because an
+  hourly policy deletes far more often than a daily one: the two are different
+  commitments an operator is agreeing to. The time of day is named only when it
+  governs — an hour-valued age runs on the hour whatever the policy holds.
   """
   @spec describe(t()) :: String.t()
   def describe(%__MODULE__{} = policy) do
     state = if policy.enabled, do: "enabled", else: "disabled"
 
-    "#{state}, keeping #{keep_label(policy.keep)}, deleting every node's logs older than that at #{hour_minute(policy.run_at)} UTC"
+    when_at =
+      case keep_cadence(policy.keep) do
+        :hourly -> "every hour"
+        :daily -> "once a day at #{hour_minute(policy.run_at)} UTC"
+      end
+
+    "#{state}, keeping #{keep_label(policy.keep)}, deleting every node's logs older than that #{when_at}"
   end
 
   @doc "The `Filter` preset value a retained age resolves to, e.g. `\"age:7d\"`."

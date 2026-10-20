@@ -88,6 +88,7 @@ defmodule LoggerDashboardWeb do
       import Phoenix.HTML
       # Core UI components
       import LoggerDashboardWeb.CoreComponents
+      import LoggerDashboardWeb.FilterControls
       import LoggerDashboardWeb.RangeInputs
 
       # Common modules used in templates

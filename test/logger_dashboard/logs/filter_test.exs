@@ -20,6 +20,59 @@ defmodule LoggerDashboard.Logs.FilterTest do
     end
   end
 
+  describe "search terms" do
+    test "splits a search into its whitespace-separated terms" do
+      assert Filter.split_terms("*timeout* db_*") == ["*timeout*", "db_*"]
+
+      assert Filter.search_terms(%{"search" => "*timeout*  db_*"}) == [
+               "*timeout*",
+               "db_*"
+             ]
+    end
+
+    test "each term keeps its own wildcard translation" do
+      assert Filter.search_patterns("*timeout* db_* a?c") == [
+               "%timeout%",
+               "db\\_%",
+               "a_c"
+             ]
+    end
+
+    test "a term with no wildcard is a keyword and matches anywhere" do
+      # A keyword that had to equal the whole message would match nothing, so
+      # a term without a wildcard is matched as a substring.
+      assert Filter.search_patterns("timeout") == ["%timeout%"]
+      assert Filter.search_patterns("timeout db") == ["%timeout%", "%db%"]
+    end
+
+    test "a search whose wildcards span the whole string is one phrase" do
+      # The spaces are inside the pattern, so they are literal.
+      assert Filter.search_patterns("*logtotal row 2*") == ["%logtotal row 2%"]
+    end
+
+    test "separate complete patterns are matched as separate terms" do
+      assert Filter.search_patterns("*boom* *one*") == ["%boom%", "%one%"]
+      assert Filter.search_patterns("*boom* db_*") == ["%boom%", "db\\_%"]
+    end
+
+    test "an empty or blank search carries no terms" do
+      assert Filter.split_terms("") == []
+      assert Filter.split_terms("   ") == []
+      assert Filter.split_terms(nil) == []
+      assert Filter.search_terms(%{}) == []
+      assert Filter.search_patterns(%{"search" => ""}) == []
+      assert Filter.search_patterns("   ") == []
+    end
+
+    test "the raw search string survives the round trip" do
+      # The URL and the input keep the operator's own text, so a multi-term
+      # search comes back exactly as it was typed.
+      assert {:ok, filter} = Filter.parse(%{"search" => "*timeout* db_*"})
+      assert filter.search == "*timeout* db_*"
+      assert Filter.to_params(filter)["search"] == "*timeout* db_*"
+    end
+  end
+
   describe "predicates/1" do
     test "no active predicate yields 1 = 1" do
       assert Filter.predicates(%Filter{}) == {"1 = 1", []}
@@ -40,10 +93,41 @@ defmodule LoggerDashboard.Logs.FilterTest do
       assert params == ["a@b", "c@d"]
     end
 
-    test "wildcard search yields a LIKE clause with the translated pattern" do
+    test "wildcard search yields a case-insensitive LIKE clause with the translated pattern" do
       assert {sql, params} = Filter.predicates(%Filter{search: "*timeout*"})
-      assert sql == "message LIKE ?"
+      assert sql == "message ILIKE ?"
       assert params == ["%timeout%"]
+    end
+
+    test "several search terms yield one clause each, combined with AND" do
+      # Every term has to match, so the clauses are ANDed and each one carries
+      # its own bound pattern.
+      assert {sql, params} = Filter.predicates(%Filter{search: "*timeout* db_*"})
+      assert sql == "message ILIKE ? AND message ILIKE ?"
+      assert params == ["%timeout%", "db\\_%"]
+    end
+
+    test "a search term never reaches the SQL string" do
+      {:ok, filter} = Filter.parse(%{"search" => "*';DROP*"})
+
+      {sql, params} = Filter.predicates(filter)
+
+      assert sql == "message ILIKE ?"
+      refute sql =~ "DROP"
+      assert params == ["%';DROP%"]
+    end
+
+    test "an injection attempt among several terms stays bound" do
+      # Whitespace separates terms, so an injection attempt is split into terms
+      # — each of which is still bound, and none of which reaches the SQL
+      # string.
+      {:ok, filter} = Filter.parse(%{"search" => "*boom* ';DROP-TABLE-logs;--*"})
+
+      {sql, params} = Filter.predicates(filter)
+
+      assert sql == "message ILIKE ? AND message ILIKE ?"
+      refute sql =~ "DROP"
+      assert params == ["%boom%", "';DROP-TABLE-logs;--%"]
     end
 
     test "composes node, level, range and message in filter order" do
@@ -59,7 +143,7 @@ defmodule LoggerDashboard.Logs.FilterTest do
       assert {sql, params} = Filter.predicates(filter)
 
       assert sql ==
-               "node IN (?) AND level IN (?) AND timestamp >= ? AND timestamp <= ? AND message LIKE ?"
+               "node IN (?) AND level IN (?) AND timestamp >= ? AND timestamp <= ? AND message ILIKE ?"
 
       assert [node, level, from, to, pattern] = params
       assert node == "a@b"
@@ -93,7 +177,7 @@ defmodule LoggerDashboard.Logs.FilterTest do
 
       {sql, params} = Filter.predicates(filter)
 
-      assert sql == "node IN (?) AND level IN (?) AND message LIKE ?"
+      assert sql == "node IN (?) AND level IN (?) AND message ILIKE ?"
       refute sql =~ "DROP"
       assert params == ["'; DROP TABLE logs; --", "error", "%boom%"]
     end
@@ -217,6 +301,92 @@ defmodule LoggerDashboard.Logs.FilterTest do
              |> Filter.nodes_to_param() == "a@b,c@d"
 
       assert Filter.nodes_to_param([]) == ""
+    end
+  end
+
+  describe "scope mutation helpers" do
+    test "toggle_node/2 adds a node to the scope" do
+      assert Filter.toggle_node(%{"node" => "a@h"}, "b@h") == %{"node" => "a@h,b@h"}
+    end
+
+    test "toggle_node/2 removes a node that is already in the scope" do
+      assert Filter.toggle_node(%{"node" => "a@h,b@h"}, "a@h") == %{"node" => "b@h"}
+    end
+
+    test "toggle_node/2 drops the param when the last node is removed" do
+      # An empty node scope is the whole system, so there is no value left to
+      # express and the param goes away.
+      assert Filter.toggle_node(%{"node" => "a@h"}, "a@h") == %{}
+    end
+
+    test "toggle_node/2 leaves the other params alone" do
+      params = %{"node" => "a@h", "level" => "error", "search" => "*boom*"}
+
+      assert Filter.toggle_node(params, "b@h") == %{
+               "node" => "a@h,b@h",
+               "level" => "error",
+               "search" => "*boom*"
+             }
+    end
+
+    test "toggle_node/2 ignores a blank node value" do
+      assert Filter.toggle_node(%{"node" => "a@h"}, "  ") == %{"node" => "a@h"}
+    end
+
+    test "select_node/2 replaces the whole scope" do
+      assert Filter.select_node(%{"node" => "a@h"}, "b@h") == %{"node" => "b@h"}
+      assert Filter.select_node(%{}, "b@h") == %{"node" => "b@h"}
+    end
+
+    test "select_node/2 ignores a blank node value" do
+      assert Filter.select_node(%{"node" => "a@h"}, "") == %{"node" => "a@h"}
+    end
+
+    test "toggle_level/2 adds a level to the set" do
+      assert Filter.toggle_level(%{"level" => "error"}, "warning") == %{
+               "level" => "error,warning"
+             }
+    end
+
+    test "toggle_level/2 removes a level that is already in the set" do
+      assert Filter.toggle_level(%{"level" => "error,warning"}, "error") == %{
+               "level" => "warning"
+             }
+    end
+
+    test "toggle_level/2 drops the param when the last level is removed" do
+      assert Filter.toggle_level(%{"level" => "error"}, "error") == %{}
+    end
+
+    test "toggle_level/2 treats all as the reset rather than a member" do
+      assert Filter.toggle_level(%{"level" => "error,warning"}, "all") == %{}
+    end
+
+    test "toggle_level/2 ignores an unknown level" do
+      assert Filter.toggle_level(%{"level" => "error"}, "fatal") == %{"level" => "error"}
+    end
+
+    test "toggle_level/2 leaves the other params alone" do
+      params = %{"node" => "a@h", "level" => "error"}
+
+      assert Filter.toggle_level(params, "info") == %{
+               "node" => "a@h",
+               "level" => "error,info"
+             }
+    end
+
+    test "select_level/2 replaces the whole set" do
+      assert Filter.select_level(%{"level" => "error"}, "warning") == %{
+               "level" => "warning"
+             }
+    end
+
+    test "select_level/2 treats all as the reset" do
+      assert Filter.select_level(%{"level" => "error"}, "all") == %{}
+    end
+
+    test "select_level/2 ignores an unknown level" do
+      assert Filter.select_level(%{"level" => "error"}, "fatal") == %{"level" => "error"}
     end
   end
 
@@ -491,7 +661,7 @@ defmodule LoggerDashboard.Logs.FilterTest do
         Filter.predicates(preset_filter)
 
       assert sql ==
-               "node IN (?, ?) AND level IN (?) AND timestamp >= ? AND timestamp <= ? AND message LIKE ?"
+               "node IN (?, ?) AND level IN (?) AND timestamp >= ? AND timestamp <= ? AND message ILIKE ?"
 
       assert node_a == "a@b"
       assert node_b == "c@d"

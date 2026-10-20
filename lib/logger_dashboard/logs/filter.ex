@@ -16,6 +16,32 @@ defmodule LoggerDashboard.Logs.Filter do
   in Ash 3.33 exposes no `:like` operator, so the filter is rejected before the
   data layer is consulted, even though `AshClickhouse` implements the
   comparison. That is why the read path is raw SQL rather than an Ash query.
+
+  ## Message search
+
+  A search is one string that may carry several terms, separated by
+  whitespace. Each term is matched on its own: a term that carries a wildcard
+  is matched as written (`db_*` is a run beginning with `db`), and a term with
+  no wildcard is a keyword that matches anywhere in the message (`timeout`
+  finds `connection timeout`). A row matches the search only when it matches
+  every term — the terms combine with AND. Matching ignores letter case,
+  so `Timeout` and `timeout` select the same rows. A single-term search
+  therefore keeps the meaning it always had, and only becomes
+  case-insensitive.
+
+  The terms are translated into one bound `message ILIKE ?` predicate each by
+  `predicates/1`, which is the single place the message clause is built: the
+  viewer, the analysis keyword aggregations, and the prune path all read
+  through it, so they cannot disagree about what a search means.
+
+  ## Scope mutation
+
+  The pages that filter by node and level share the vocabulary above, so they
+  also share the way a scope changes: `toggle_node/2` and `toggle_level/2` are
+  the multi-select mode the Logs and Analysis pages use, and `select_node/2`
+  and `select_level/2` are the single-select mode the Prune page uses. Each
+  takes the current params and returns the next ones, so a page's handler
+  never has to re-implement the param format the filters parse.
   """
 
   @levels ~w(error warning info debug all)
@@ -273,6 +299,9 @@ defmodule LoggerDashboard.Logs.Filter do
   Translate a user wildcard (`*` = any run, `?` = single char) to a
   ClickHouse `LIKE` pattern (`%`/`_`, with `%_\\` escaped).
   Empty search returns `nil` (no predicate).
+
+  This is the translation of a single term. A search that carries several
+  terms is translated term by term — see `to_like_patterns/1`.
   """
   @spec to_like_pattern(String.t() | nil) :: String.t() | nil
   def to_like_pattern(nil), do: nil
@@ -293,13 +322,88 @@ defmodule LoggerDashboard.Logs.Filter do
   end
 
   @doc """
+  Split a search string into its terms.
+
+  Terms are separated by whitespace, and an empty or blank string has no
+  terms. Splitting rather than keeping the string whole is what lets a search
+  carry several patterns: each term is translated and matched on its own, and
+  a row has to match every one of them.
+  """
+  @spec split_terms(String.t() | nil) :: [String.t()]
+  def split_terms(nil), do: []
+  def split_terms(""), do: []
+
+  def split_terms(search) when is_binary(search),
+    do: search |> String.split(~r/\s+/, trim: true) |> Enum.reject(&(&1 == ""))
+
+  @doc """
+  The search terms carried by the `search` param.
+
+  A params map is the input, so the terms come from the same place every
+  other filter value does.
+  """
+  @spec search_terms(map()) :: [String.t()]
+  def search_terms(params) when is_map(params) do
+    params
+    |> get("search", "")
+    |> to_string()
+    |> split_terms()
+  end
+
+  @doc """
+  The `LIKE` patterns a search matches with, one per term.
+
+  A search is a list of terms separated by whitespace, and a row has to match
+  every one of them. A term that carries a wildcard is matched exactly as
+  written: `db_*` is a run beginning with `db`. A term with no wildcard is a
+  keyword, and matches anywhere in the message — `timeout` finds
+  `connection timeout`. Without that, a keyword would have to equal the whole
+  message, which is not what a keyword search is for.
+
+  A term that opens a wildcard and does not close it means the wildcards span
+  the whole search, so the search is one pattern and its spaces are literal:
+  `*logtotal row 2*` is the phrase "logtotal row 2", and `*boom* *one*` is
+  two terms that both have to match. A search with no terms yields no
+  patterns and therefore no message predicate.
+  """
+  @spec search_patterns(map() | String.t()) :: [String.t()]
+  def search_patterns(params) when is_map(params),
+    do: params |> get("search", "") |> to_string() |> search_patterns()
+
+  def search_patterns(search) when is_binary(search) do
+    chunks = split_terms(search)
+
+    if Enum.all?(chunks, &standalone_term?/1) do
+      Enum.map(chunks, &term_pattern/1)
+    else
+      [to_like_pattern(search)]
+    end
+  end
+
+  # A term stands alone when it carries no wildcard, or when the wildcards it
+  # does carry close inside it. A term that opens a wildcard and does not
+  # close it is the start of a pattern that runs on into the next term.
+  defp standalone_term?(chunk) do
+    not String.starts_with?(chunk, ["*", "?"]) or String.ends_with?(chunk, ["*", "?"])
+  end
+
+  defp term_pattern(term) do
+    pattern = to_like_pattern(term)
+
+    if String.contains?(term, "*") or String.contains?(term, "?"),
+      do: pattern,
+      else: "%" <> pattern <> "%"
+  end
+
+  @doc """
   Build the shared `WHERE` clause for a validated filter.
 
   Emits `node IN (...)`, `level IN (...)`, and `timestamp` predicates plus
-  `message LIKE ?` when and only when a search pattern is present. Every value
-  is a bound parameter and no user input reaches the SQL string, so one clause
-  set is safe for both the raw read path and prune. Callers append their own
-  trailing clause (`ORDER BY`/`LIMIT` for reads, nothing for prune).
+  one `message ILIKE ?` per search term when and only when the search carries
+  terms. Every value is a bound parameter and no user input reaches the SQL
+  string, so one clause set is safe for both the raw read path and prune.
+  Callers append their own trailing clause (`ORDER BY`/`LIMIT` for reads,
+  nothing for prune).
 
   An empty node list applies no node predicate and an empty level list applies
   no level predicate, so a filter with no active predicate yields
@@ -322,13 +426,23 @@ defmodule LoggerDashboard.Logs.Filter do
         do: maybe_push(clauses, params, "timestamp <= ?", filter.to),
         else: {clauses, params}
 
-    {clauses, params} =
-      maybe_push(clauses, params, "message LIKE ?", to_like_pattern(filter.search))
+    {clauses, params} = push_search(clauses, params, filter.search)
 
     case Enum.reverse(clauses) do
       [] -> {"1 = 1", []}
       ordered -> {Enum.join(ordered, " AND "), Enum.reverse(params)}
     end
+  end
+
+  # One clause per search term, each bound, combined with AND — a row has to
+  # match every term. The operator is `ILIKE` so a term matches regardless of
+  # the case the message was written in.
+  defp push_search(clauses, params, search) do
+    search
+    |> search_patterns()
+    |> Enum.reduce({clauses, params}, fn pattern, {clauses, params} ->
+      maybe_push(clauses, params, "message ILIKE ?", pattern)
+    end)
   end
 
   defp maybe_push_nodes(clauses, params, []), do: {clauses, params}
@@ -458,6 +572,105 @@ defmodule LoggerDashboard.Logs.Filter do
   @doc "Render a level list back to its comma-separated form, for display or URL params."
   @spec levels_to_param([String.t()]) :: String.t()
   def levels_to_param(levels) when is_list(levels), do: Enum.join(levels, ",")
+
+  @doc """
+  Toggle a node in or out of the node scope.
+
+  The multi-select mode the Logs and Analysis pages use: clicking an option
+  adds it to the scope, clicking it again removes it, and removing the last
+  node drops the `node` param entirely — an empty scope is the whole system,
+  and there is no value left to express. The other params are untouched.
+  """
+  @spec toggle_node(map(), String.t()) :: map()
+  def toggle_node(params, node) when is_map(params) do
+    name = String.trim(to_string(node))
+
+    if name == "" do
+      params
+    else
+      nodes = parse_nodes(params)
+
+      nodes =
+        if name in nodes,
+          do: Enum.reject(nodes, &(&1 == name)),
+          else: Enum.uniq(nodes ++ [name])
+
+      put_or_drop(params, "node", nodes_to_param(nodes))
+    end
+  end
+
+  @doc """
+  Select a single node as the whole node scope.
+
+  The single-select mode the Prune page uses: the clicked node replaces
+  whatever the scope was, so the operator can never widen a prune by accident.
+  """
+  @spec select_node(map(), String.t()) :: map()
+  def select_node(params, node) when is_map(params) do
+    name = String.trim(to_string(node))
+
+    if name == "", do: params, else: Map.put(params, "node", name)
+  end
+
+  @doc """
+  Toggle a level in or out of the active level set.
+
+  The multi-select mode the Logs and Analysis pages use. `all` is the reset
+  rather than a member of the set: it drops the `level` param, which is the
+  same thing as an empty scope. An unknown level is ignored.
+  """
+  @spec toggle_level(map(), String.t()) :: map()
+  def toggle_level(params, level) when is_map(params) do
+    case normalize_level(level) do
+      "all" -> Map.delete(params, "level")
+      level when level in @level_values -> toggle_level_member(params, level)
+      _other -> params
+    end
+  end
+
+  @doc """
+  Select a single level as the whole level scope.
+
+  The single-select mode the Prune page uses: the clicked level replaces the
+  previous one, and `all` drops the `level` param. An unknown level is
+  ignored.
+  """
+  @spec select_level(map(), String.t()) :: map()
+  def select_level(params, level) when is_map(params) do
+    case normalize_level(level) do
+      "all" -> Map.delete(params, "level")
+      level when level in @level_values -> Map.put(params, "level", level)
+      _other -> params
+    end
+  end
+
+  # The level set is read back from the params rather than from a parsed
+  # filter, so a toggle still works while another filter in the same request
+  # failed validation. An unparseable set starts empty rather than blocking
+  # the click.
+  defp toggle_level_member(params, level) do
+    levels =
+      case parse_levels(params) do
+        {:ok, levels} -> levels
+        {:error, _error} -> []
+      end
+
+    levels =
+      if level in levels,
+        do: Enum.reject(levels, &(&1 == level)),
+        else: levels ++ [level]
+
+    put_or_drop(params, "level", levels_to_param(levels))
+  end
+
+  defp normalize_level(level), do: level |> to_string() |> String.trim() |> String.downcase()
+
+  # An empty value carries no scope, so the param is dropped rather than set
+  # to an empty string: "no node" and "all nodes" are the same scope, and the
+  # URL should say so by absence.
+  defp put_or_drop(params, key, value) do
+    if value == "", do: Map.delete(params, key), else: Map.put(params, key, value)
+  end
 
   defp parse_preset(params) do
     case get(params, "preset", nil) |> to_string() |> String.trim() do

@@ -156,66 +156,24 @@ defmodule LoggerDashboardWeb.LogLive.Index do
   @impl true
   def handle_event("toggle-node", %{"node" => node}, socket) do
     # Clicking a node option toggles it in or out of the comma-separated scope.
-    # Read back from the URL params rather than the parsed filter so the toggle
-    # also works while the page shows a validation error, and write back
-    # through the same `node` param so parsing stays the single validator.
-    # Other filters ride along untouched, like `clear_nodes`.
-    case String.trim(to_string(node)) do
-      "" ->
-        {:noreply, socket}
+    # The toggle itself lives in `Filter`, which owns the `node` param's
+    # format, so the viewer and the analysis page cannot drift apart on how a
+    # scope is written down. Other filters ride along untouched, like
+    # `clear_nodes`.
+    params = Filter.toggle_node(socket.assigns.filter_params, node)
 
-      name ->
-        nodes = Filter.parse_nodes(socket.assigns.filter_params)
-
-        nodes =
-          if name in nodes,
-            do: Enum.reject(nodes, &(&1 == name)),
-            else: Enum.uniq(nodes ++ [name])
-
-        params =
-          case Filter.nodes_to_param(nodes) do
-            "" -> Map.delete(socket.assigns.filter_params, "node")
-            param -> Map.put(socket.assigns.filter_params, "node", param)
-          end
-
-        {:noreply, push_patch(socket, to: ~p"/logs?#{params}")}
-    end
+    {:noreply, push_patch(socket, to: ~p"/logs?#{params}")}
   end
 
   @impl true
   def handle_event("select-level", %{"level" => level}, socket) do
     # A level click toggles it in or out of the comma-separated set through
     # the same `level` param the form submits, so validation, bookmarking, and
-    # export stay unified. Read back from the URL params rather than the
-    # parsed filter so the toggle also works while the page shows a validation
-    # error. An unknown level is ignored here; hand-typed values still travel
-    # the form path where `Filter.parse/1` reports them.
-    level = level |> to_string() |> String.trim() |> String.downcase()
+    # export stay unified. An unknown level is ignored here; hand-typed values
+    # still travel the form path where `Filter.parse/1` reports them.
+    params = Filter.toggle_level(socket.assigns.filter_params, level)
 
-    cond do
-      level == "all" ->
-        params = Map.delete(socket.assigns.filter_params, "level")
-        {:noreply, push_patch(socket, to: ~p"/logs?#{params}")}
-
-      level in Filter.level_values() ->
-        levels = selected_levels(socket.assigns.filter_params)
-
-        levels =
-          if level in levels,
-            do: Enum.reject(levels, &(&1 == level)),
-            else: levels ++ [level]
-
-        params =
-          case Filter.levels_to_param(levels) do
-            "" -> Map.delete(socket.assigns.filter_params, "level")
-            param -> Map.put(socket.assigns.filter_params, "level", param)
-          end
-
-        {:noreply, push_patch(socket, to: ~p"/logs?#{params}")}
-
-      true ->
-        {:noreply, socket}
-    end
+    {:noreply, push_patch(socket, to: ~p"/logs?#{params}")}
   end
 
   @impl true
@@ -402,16 +360,6 @@ defmodule LoggerDashboardWeb.LogLive.Index do
   defp normalize_filter_params(params) when is_map(params),
     do: Map.take(params, @filter_keys)
 
-  # The level set is read straight off the params rather than the parsed
-  # filter, so the toggle badges stay correct even when another filter in the
-  # same request failed validation and left the query unparsed.
-  defp selected_levels(filter_params) do
-    case Filter.parse_levels(filter_params) do
-      {:ok, levels} -> levels
-      {:error, _} -> []
-    end
-  end
-
   # The per-page options follow the `limit` the select actually shows, including
   # on the rejected-filter path where the rest of the form is built from raw
   # params and no `Filter` exists to read a limit off. `parse/1` only rejects
@@ -478,16 +426,6 @@ defmodule LoggerDashboardWeb.LogLive.Index do
           >
             <.icon name="hero-chart-bar" class="size-4" /> Analyze these filters
           </.link>
-
-          <button
-            type="button"
-            id="logs-clear-nodes"
-            phx-click="clear_nodes"
-            hidden={@filter.nodes == []}
-            class="btn btn-ghost btn-sm"
-          >
-            <.icon name="hero-x-mark" class="size-4" /> Clear nodes
-          </button>
         </div>
       </div>
 
@@ -512,41 +450,15 @@ defmodule LoggerDashboardWeb.LogLive.Index do
             scoped by. There is no free-text node input: badges are the only
             node selector. Select-all returns to whole-system scope, exactly
             like clearing. --%>
-      <div id="logs-node-options" class="flex flex-wrap items-center gap-2 text-sm">
-        <span class="text-base-content/70">All nodes:</span>
-        <button
-          :for={node <- @node_options}
-          type="button"
-          id={"logs-node-#{Base.url_encode64(node, padding: false)}"}
-          phx-click="toggle-node"
-          phx-value-node={node}
-          data-node={node}
-          aria-pressed={to_string(node in @filter.nodes)}
-          title={
-            if node in @filter.nodes, do: "Remove #{node} from scope", else: "Add #{node} to scope"
-          }
-          class={[
-            "badge cursor-pointer border",
-            node in @filter.nodes && "badge-primary",
-            node not in @filter.nodes && "badge-outline badge-ghost hover:badge-primary"
-          ]}
-        >
-          {node}
-        </button>
-        <button
-          type="button"
-          id="logs-select-all-nodes"
-          phx-click="select-all-nodes"
-          hidden={@filter.nodes == []}
-          title="Return to whole-system scope"
-          class="badge cursor-pointer border badge-outline badge-ghost hover:badge-primary"
-        >
-          Select all
-        </button>
-        <span :if={@node_options == []} class="text-xs text-base-content/50">
-          No known nodes.
-        </span>
-      </div>
+      <.node_options
+        id="logs"
+        options={@node_options}
+        selected={@filter.nodes}
+        mode={:multi}
+        toggle_event="toggle-node"
+        select_all_event="select-all-nodes"
+        clear_event="clear_nodes"
+      />
 
       <%!-- Badge toggles, shortcuts, and selects apply immediately through the
             URL; search and bounds commit on change (debounced, never per
@@ -561,38 +473,20 @@ defmodule LoggerDashboardWeb.LogLive.Index do
         class="grid grid-cols-1 gap-3 rounded-xl border border-base-300 bg-base-100 p-4 md:grid-cols-6"
       >
         <div class="md:col-span-4">
-          <.input field={@form[:search]} label="Search (* wildcards)" placeholder="*timeout*" />
+          <.search id="logs" field={@form[:search]} />
         </div>
         <.bound id="logs" bound={:from} field={@form[:from]} label="From (UTC)" />
         <.bound id="logs" bound={:to} field={@form[:to]} label="To (UTC)" />
         <%!-- Single level selector: toggle badges through the `level` URL param.
               Full-width row so wrapping grows the card instead of overlapping
               neighbouring inputs. An empty set (or `all`) applies no predicate. --%>
-        <div
-          id="logs-level-options"
+        <.level_options
+          id="logs"
+          selected={@filter.levels}
+          mode={:multi}
+          toggle_event="select-level"
           class="flex flex-wrap items-center gap-2 text-sm md:col-span-6"
-          role="group"
-          aria-label="Level filter"
-        >
-          <span class="text-base-content/70">Level:</span>
-          <button
-            :for={level <- Filter.levels()}
-            type="button"
-            id={"logs-level-#{level}"}
-            phx-click="select-level"
-            phx-value-level={level}
-            data-level={level}
-            aria-pressed={to_string(Filter.level_active?(@filter.levels, level))}
-            class={[
-              "badge cursor-pointer border uppercase",
-              Filter.level_active?(@filter.levels, level) && "badge-primary",
-              !Filter.level_active?(@filter.levels, level) &&
-                "badge-outline badge-ghost hover:badge-primary"
-            ]}
-          >
-            {level}
-          </button>
-        </div>
+        />
         <div class="md:col-span-2">
           <.input field={@form[:limit]} label="Per page" type="select" options={@limit_options} />
         </div>

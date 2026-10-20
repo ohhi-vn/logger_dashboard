@@ -66,16 +66,10 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
 
       lv |> element(~s(#prune-shortcuts [data-preset='age:6h'])) |> render_click()
 
-      lv
-      |> element("#prune-form")
-      |> render_submit(%{
-        "prune" => %{"scope" => "all", "from" => "", "to" => ""}
-      })
-
-      # The form carries the resolved `to`; the confirmation then states the
-      # cutoff it would delete against, and `from` stays unset.
-      html = render(lv)
-      assert html =~ "older than"
+      # The review is computed from the scope in effect, so the cutoff the
+      # shortcut resolved to is stated right away, with `from` still unset.
+      assert has_element?(lv, "#prune-review")
+      assert lv |> element("#prune-review-scope") |> render() =~ "to 20"
     end
 
     test "a shortcut sets only the upper bound and leaves the node scope alone", %{conn: conn} do
@@ -97,37 +91,29 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
       assert has_element?(lv, ~s(#prune-active-scope [data-node="a@h"]))
     end
 
-    test "a shortcut alone never previews, confirms, or deletes", %{conn: conn} do
+    test "a shortcut alone never deletes", %{conn: conn} do
       {:ok, lv, _html} = live(conn, "/prune?scope=node&node=a%40h")
 
       lv |> element("#prune-shortcuts [data-preset='age:30d']") |> render_click()
 
-      # Clicking a cutoff is not a destructive request. The delete is still only
-      # reachable through an explicit confirm.
-      refute has_element?(lv, "#prune-confirm")
+      # Clicking a cutoff is not a destructive request. The review appears, but
+      # the delete is still only reachable through an explicit confirm.
+      assert has_element?(lv, "#prune-review")
       refute has_element?(lv, "#prune-result")
     end
 
-    test "a shortcut satisfies the bound requirement and reaches the preview", %{conn: conn} do
+    test "a shortcut satisfies the bound requirement and reaches the review", %{conn: conn} do
       {:ok, lv, _html} = live(conn, "/prune?scope=node&node=a%40h")
       lv |> element("#prune-shortcuts [data-preset='age:7d']") |> render_click()
 
-      # The shortcut resolved a concrete `to` into the form; the push carries
-      # it along with the badge-selected node, exactly as the form submit did
-      # when the node field still existed. Pushed directly rather than through
-      # `form/3`, which rejects a node value its inputs do not offer.
-      to = prune_field(lv, "prune_to")
-      assert to != ""
-
-      render_submit(lv, "preview", %{
-        "prune" => %{scope: "node", node: "a@h", level: "all", to: to}
-      })
-
-      assert has_element?(lv, "#prune-confirm")
+      # The shortcut resolved a concrete cutoff, so the scope is bounded and
+      # the review is computed without a separate action.
+      assert prune_field(lv, "prune_to") != ""
+      assert has_element?(lv, "#prune-review")
       refute has_element?(lv, "#prune-error")
 
       # The confirmation states the concrete cutoff, not just the label.
-      assert lv |> element("#prune-preview-scope") |> render() =~ "to 20"
+      assert lv |> element("#prune-review-scope") |> render() =~ "to 20"
     end
 
     test "clearing the shortcut's cutoff restores the unbounded rejection", %{conn: conn} do
@@ -135,12 +121,12 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
       lv |> element("#prune-shortcuts [data-preset='age:7d']") |> render_click()
       refute prune_field(lv, "prune_to") == ""
 
-      render_submit(lv, "preview", %{
-        "prune" => %{scope: "node", node: "a@h", level: "all", to: ""}
-      })
+      # Clearing the cutoff commits the empty bound, which drops the shortcut
+      # and leaves the scope unbounded.
+      render_change(lv, "filter", %{"prune" => %{"from" => "", "to" => ""}})
 
       assert has_element?(lv, "#prune-error")
-      refute has_element?(lv, "#prune-confirm")
+      refute has_element?(lv, "#prune-review")
     end
 
     test "an edited cutoff is used as typed rather than re-resolved", %{conn: conn} do
@@ -148,20 +134,20 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
 
       edited = "2026-03-01T00:00:00Z"
 
-      render_submit(lv, "preview", %{
-        "prune" => %{scope: "node", node: "a@h", level: "all", to: edited}
-      })
+      render_change(lv, "filter", %{"prune" => %{"from" => "", "to" => edited}})
 
-      assert has_element?(lv, "#prune-confirm")
-      assert lv |> element("#prune-preview-scope") |> render() =~ "2026-03-01"
-      refute lv |> element("#prune-preview-scope") |> render() =~ ~r/to 20\d\d-10-/
+      assert has_element?(lv, "#prune-review")
+
+      scope = lv |> element("#prune-review-scope") |> render()
+      assert scope =~ "2026-03-01"
+      refute scope =~ ~r/to 20\d\d-10-/
     end
 
-    test "an unrecognized cutoff is rejected and reaches no preview", %{conn: conn} do
+    test "an unrecognized cutoff is rejected and reaches no review", %{conn: conn} do
       {:ok, lv, _html} = live(conn, "/prune?scope=node&node=a%40h&preset=age:2d")
 
       assert has_element?(lv, "#prune-error")
-      refute has_element?(lv, "#prune-confirm")
+      refute has_element?(lv, "#prune-review")
     end
 
     test "a cutoff on the whole-system scope keeps the whole-system scope", %{conn: conn} do
@@ -260,41 +246,56 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
       node: node,
       now: now
     } do
-      {:ok, lv, _html} = live(conn, "/prune?scope=node&node=#{node}")
+      from = DateTime.to_iso8601(DateTime.add(now, -60, :minute))
 
-      # The submit carries no node — badges own the scope — so the preview
-      # reads it back from the page state.
-      lv
-      |> form("#prune-form",
-        prune: %{
-          level: "all",
-          from: DateTime.to_iso8601(DateTime.add(now, -60, :minute))
-        }
-      )
-      |> render_submit()
+      # The scope and the bounds are in the URL, so the review is computed
+      # from them without a separate action.
+      {:ok, lv, _html} = live(conn, "/prune?scope=node&node=#{node}&from=#{from}")
 
-      assert has_element?(lv, "#prune-confirm")
-      assert has_element?(lv, "#prune-preview-count", ~r/Rows that will be deleted: 2/)
-      assert has_element?(lv, "#prune-preview-rows")
-      assert has_element?(lv, "#prune-preview-rows", "preview ui newest")
-      assert has_element?(lv, "#prune-preview-rows", "preview ui older")
+      assert has_element?(lv, "#prune-review")
+      assert has_element?(lv, "#prune-review-count", ~r/Rows that would be deleted: 2/)
+      assert has_element?(lv, "#prune-review-rows")
+      assert has_element?(lv, "#prune-review-rows", "preview ui newest")
+      assert has_element?(lv, "#prune-review-rows", "preview ui older")
+    end
+
+    test "the review counts the same rows the viewer totals for the same scope", %{
+      conn: conn,
+      node: node
+    } do
+      from = "2000-01-01T00:00:00Z"
+
+      {:ok, prune_lv, _html} = live(conn, "/prune?scope=node&node=#{node}&from=#{from}")
+      {:ok, logs_lv, _html} = live(conn, "/logs?node=#{node}&from=#{from}")
+
+      # The same scope, read two ways, counts the same rows: the review and
+      # the viewer's total are the same predicate.
+      assert prune_lv |> element("#prune-review-count") |> render() =~
+               "Rows that would be deleted: 2"
+
+      assert logs_lv |> element("#logs-total") |> render() =~ "Total 2"
+    end
+
+    test "states how the rows are spread across the nodes in scope", %{
+      conn: conn,
+      node: node
+    } do
+      {:ok, lv, _html} = live(conn, "/prune?scope=node&node=#{node}&from=2000-01-01T00:00:00Z")
+
+      # The per-node split is part of the blast radius: a whole-system prune
+      # says which nodes it takes with it.
+      assert has_element?(lv, "#prune-review-nodes")
+      assert has_element?(lv, ~s(#prune-review-nodes [data-node="#{node}"]))
     end
 
     test "an empty scope states zero and offers no sample", %{conn: conn} do
       node = "no-such-node-#{System.unique_integer([:positive])}@host"
-      {:ok, lv, _html} = live(conn, ~p"/prune?scope=node&node=#{node}")
 
-      # The submit carries no node — badges own the scope — so the preview
-      # reads it back from the page state.
-      lv
-      |> form("#prune-form",
-        prune: %{level: "all", from: "2000-01-01T00:00:00Z"}
-      )
-      |> render_submit()
+      {:ok, lv, _html} = live(conn, "/prune?scope=node&node=#{node}&from=2000-01-01T00:00:00Z")
 
-      assert has_element?(lv, "#prune-confirm")
-      assert has_element?(lv, "#prune-preview-count", ~r/Rows that will be deleted: 0/)
-      refute has_element?(lv, "#prune-preview-rows")
+      assert has_element?(lv, "#prune-review")
+      assert has_element?(lv, "#prune-review-count", ~r/Rows that would be deleted: 0/)
+      refute has_element?(lv, "#prune-review-rows")
     end
   end
 
@@ -337,6 +338,45 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
       refute has_element?(lv, ~s(#prune-form input[type="text"][name="prune[node]"]))
     end
 
+    test "offers exactly one level control, with no second level field in the form", %{
+      conn: conn
+    } do
+      {:ok, lv, _html} = live(conn, ~p"/prune")
+
+      assert has_element?(lv, "#prune-level-options")
+
+      # The badges own the level: the form carries no second way to set it.
+      refute has_element?(lv, ~s(#prune-form select[name="prune[level]"]))
+
+      for level <- ~w(error warning info debug all) do
+        assert has_element?(lv, ~s(#prune-level-options [data-level="#{level}"]))
+      end
+    end
+
+    test "the level control is single-select: a click replaces the previous level", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/prune")
+
+      lv |> element(~s(#prune-level-options [data-level="error"])) |> render_click()
+
+      assert has_element?(
+               lv,
+               ~s(#prune-level-options [data-level="error"][aria-pressed="true"])
+             )
+
+      lv |> element(~s(#prune-level-options [data-level="warning"])) |> render_click()
+
+      # The level is replaced rather than added to: a prune targets one level.
+      assert has_element?(
+               lv,
+               ~s(#prune-level-options [data-level="warning"][aria-pressed="true"])
+             )
+
+      assert has_element?(
+               lv,
+               ~s(#prune-level-options [data-level="error"][aria-pressed="false"])
+             )
+    end
+
     test "clicking a node option selects the single-node scope", %{conn: conn, tag: tag} do
       {:ok, lv, _html} = live(conn, ~p"/prune?scope=all")
 
@@ -369,7 +409,7 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
 
       assert has_element?(
                lv,
-               "#prune-form select[name='prune[level]'] option[selected][value='error']"
+               ~s(#prune-level-options [data-level="error"][aria-pressed="true"])
              )
 
       assert prune_field(lv, "prune_from") == "2026-01-01T00:00:00Z"
@@ -388,28 +428,18 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
       refute has_element?(lv, "#prune-result")
     end
 
-    test "clicking a node option clears a stale preview", %{conn: conn, tag: tag} do
-      {:ok, lv, _html} = live(conn, "/prune?scope=node&node=other%40h")
+    test "clicking a node option recomputes the review for the new scope", %{conn: conn, tag: tag} do
+      {:ok, lv, _html} = live(conn, "/prune?scope=node&node=other%40h&from=2026-01-01T00:00:00Z")
 
-      # A hand-crafted scope the badges do not offer still previews: it is
-      # pushed directly because the form carries no node field.
-      render_submit(lv, "preview", %{
-        "prune" => %{
-          scope: "node",
-          node: "other@h",
-          level: "all",
-          from: "2026-01-01T00:00:00Z",
-          to: "2026-02-01T00:00:00Z"
-        }
-      })
-
-      assert has_element?(lv, "#prune-confirm")
+      assert has_element?(lv, "#prune-review")
 
       lv |> element(~s(#prune-node-options [data-node="#{tag}"])) |> render_click()
 
-      # The confirmation for the other scope is gone; deleting still requires
-      # a fresh preview and confirm for the newly selected node.
-      refute has_element?(lv, "#prune-confirm")
+      # The review now describes the newly selected node and never the scope
+      # that was in effect before the click.
+      scope = lv |> element("#prune-review-scope") |> render()
+      assert scope =~ tag
+      refute scope =~ "other@h"
 
       assert has_element?(
                lv,
@@ -425,12 +455,14 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
 
       assert has_element?(
                lv,
-               "#prune-form select[name='prune[level]'] option[selected][value='error']"
+               ~s(#prune-level-options [data-level="error"][aria-pressed="true"])
              )
 
       assert has_element?(lv, ~s(#prune-active-scope [data-node="a@h"]))
       assert prune_field(lv, "prune_from") == "2026-01-01T00:00:00Z"
-      refute has_element?(lv, "#prune-confirm")
+
+      # Choosing a level is not a destructive request.
+      refute has_element?(lv, "#prune-result")
     end
 
     test "clicking an unknown level or a blank node is ignored", %{conn: conn} do
@@ -441,7 +473,7 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
 
       assert has_element?(
                lv,
-               "#prune-form select[name='prune[level]'] option[selected][value='error']"
+               ~s(#prune-level-options [data-level="error"][aria-pressed="true"])
              )
 
       assert has_element?(lv, ~s(#prune-active-scope [data-node="a@h"]))
@@ -459,13 +491,12 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
 
       assert has_element?(
                lv,
-               "#prune-form select[name='prune[level]'] option[selected][value='error']"
+               ~s(#prune-level-options [data-level="error"][aria-pressed="true"])
              )
 
       assert prune_field(lv, "prune_from") == "2026-01-01T00:00:00Z"
 
       # Selecting a scope is never a destructive request.
-      refute has_element?(lv, "#prune-confirm")
       refute has_element?(lv, "#prune-result")
     end
 
@@ -494,18 +525,17 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
 
       assert has_element?(
                lv,
-               "#prune-form select[name='prune[level]'] option[selected][value='error']"
+               ~s(#prune-level-options [data-level="error"][aria-pressed="true"])
              )
 
-      # State only: no preview, no confirmation, no delete.
-      refute has_element?(lv, "#prune-confirm")
+      # The mark is accepted, so the review states what an unbounded delete
+      # would take — and nothing is deleted.
+      assert has_element?(lv, "#prune-review")
       refute has_element?(lv, "#prune-result")
       refute has_element?(lv, "#prune-error")
     end
 
-    test "previewing an all-time scope reaches confirm stating every row in scope", %{
-      conn: conn
-    } do
+    test "an all-time scope reaches the review stating every row in scope", %{conn: conn} do
       node =
         "prune-alltime-#{System.system_time(:millisecond)}-#{:rand.uniform(1_000_000)}@host"
 
@@ -513,39 +543,33 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
 
       lv |> element("#prune-shortcuts [data-preset='age:all']") |> render_click()
 
-      # The submit carries no bounds and no node: the mark and the scope both
-      # come back from the page state.
-      lv
-      |> form("#prune-form", prune: %{level: "all"})
-      |> render_submit()
-
-      assert has_element?(lv, "#prune-confirm")
-      assert lv |> element("#prune-preview-scope") |> render() =~ "every row in scope"
+      assert has_element?(lv, "#prune-review")
+      assert lv |> element("#prune-review-scope") |> render() =~ "every row in scope"
     end
 
     test "hand-cleared bounds without all time stay rejected", %{conn: conn} do
-      {:ok, lv, _html} = live(conn, ~p"/prune")
+      {:ok, lv, _html} = live(conn, "/prune?from=2026-01-01T00:00:00Z")
 
-      lv
-      |> form("#prune-form", prune: %{level: "all"})
-      |> render_submit()
+      assert has_element?(lv, "#prune-review")
+
+      # Clearing the bounds leaves the scope unbounded with no mark to allow
+      # it, so there is nothing to review and the reason is stated.
+      render_change(lv, "filter", %{"prune" => %{"from" => "", "to" => ""}})
 
       assert has_element?(lv, "#prune-error")
-      refute has_element?(lv, "#prune-confirm")
+      refute has_element?(lv, "#prune-review")
     end
 
-    test "typing a bound after all time makes the preview bounded again", %{conn: conn} do
+    test "typing a bound after all time makes the scope bounded again", %{conn: conn} do
       {:ok, lv, _html} = live(conn, "/prune?scope=node&node=a%40h")
 
       lv |> element("#prune-shortcuts [data-preset='age:all']") |> render_click()
 
-      lv
-      |> form("#prune-form", prune: %{level: "all", to: "2026-03-01T00:00:00Z"})
-      |> render_submit()
+      render_change(lv, "filter", %{"prune" => %{"from" => "", "to" => "2026-03-01T00:00:00Z"}})
 
-      assert has_element?(lv, "#prune-confirm")
+      assert has_element?(lv, "#prune-review")
 
-      scope = lv |> element("#prune-preview-scope") |> render()
+      scope = lv |> element("#prune-review-scope") |> render()
       assert scope =~ "2026-03-01"
       refute scope =~ "every row in scope"
     end
@@ -556,22 +580,18 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
       refute has_element?(lv, "#prune-refresh")
     end
 
-    test "a badge-selected node previews without a node text field", %{conn: conn} do
+    test "a badge-selected node is reviewed without a node text field", %{conn: conn} do
       node =
         "prune-badge-#{System.system_time(:millisecond)}-#{:rand.uniform(1_000_000)}@host"
 
-      {:ok, lv, _html} = live(conn, "/prune?scope=node&node=#{node}")
+      {:ok, lv, _html} = live(conn, "/prune?scope=node&node=#{node}&from=2026-01-01T00:00:00Z")
 
       assert has_element?(lv, ~s(#prune-active-scope [data-node="#{node}"]))
 
-      # The form carries no node field, so the preview must read the
-      # badge-selected scope from the page state rather than the form.
-      lv
-      |> form("#prune-form", prune: %{level: "all", from: "2026-01-01T00:00:00Z"})
-      |> render_submit()
-
-      assert has_element?(lv, "#prune-confirm")
-      assert lv |> element("#prune-preview-scope") |> render() =~ node
+      # The form carries no node field, so the review reads the badge-selected
+      # scope from the page state rather than the form.
+      assert has_element?(lv, "#prune-review")
+      assert lv |> element("#prune-review-scope") |> render() =~ node
     end
   end
 
@@ -580,7 +600,30 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
       {:ok, lv, _html} = live(conn, ~p"/prune")
 
       assert has_element?(lv, "#prune-form")
-      refute has_element?(lv, "#prune-confirm")
+      refute has_element?(lv, "#prune-review")
+    end
+
+    test "renders the operation as ordered steps with the current one marked", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/prune")
+
+      assert has_element?(lv, "#prune-steps")
+
+      for step <- ~w(scope cutoff review confirm) do
+        assert has_element?(lv, "#prune-steps-#{step}")
+      end
+
+      # With no cutoff set there is nothing to review, so the operator is at
+      # the cutoff step.
+      assert has_element?(lv, "#prune-steps-cutoff[aria-current=step]")
+    end
+
+    test "the scope, the level, the cutoff and the actions share one card", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/prune")
+
+      assert has_element?(lv, "#prune-card #prune-node-options")
+      assert has_element?(lv, "#prune-card #prune-level-options")
+      assert has_element?(lv, "#prune-card #prune-form")
+      assert has_element?(lv, "#prune-card #prune-shortcuts")
     end
 
     test "renders navigation with prune marked as the active page", %{conn: conn} do
@@ -609,30 +652,24 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
     end
 
     test "a multi-node value is rejected instead of silently pruned", %{conn: conn} do
-      {:ok, lv, _html} = live(conn, ~p"/prune")
-
       # The viewer accepts comma-separated nodes; prune must not, because its
-      # confirmation names a single node. Pushed directly: the form carries no
-      # node field for a multi-node value to travel through.
-      render_submit(lv, "preview", %{
-        "prune" => %{scope: "node", node: "a@h,b@h", level: "all", from: "2020-01-01T00:00:00Z"}
-      })
+      # confirmation names a single node. The scope travels in the URL, since
+      # the form carries no node field.
+      {:ok, lv, _html} =
+        live(conn, "/prune?scope=node&node=a%40h%2Cb%40h&from=2020-01-01T00:00:00Z")
 
       assert has_element?(lv, "#prune-error")
-      refute has_element?(lv, "#prune-confirm")
+      refute has_element?(lv, "#prune-review")
     end
 
     test "missing node shows validation error and no delete", %{conn: conn} do
-      {:ok, lv, _html} = live(conn, ~p"/prune")
-
-      # Pushed directly: the form carries no node field, and an empty scope
-      # must still be refused rather than treated as whole-system.
-      render_submit(lv, "preview", %{
-        "prune" => %{scope: "node", node: "", level: "all"}
-      })
+      # The scope travels in the URL, since the form carries no node field,
+      # and an empty scope must still be refused rather than treated as
+      # whole-system.
+      {:ok, lv, _html} = live(conn, "/prune?scope=node&from=2020-01-01T00:00:00Z")
 
       assert has_element?(lv, "#prune-error")
-      refute has_element?(lv, "#prune-confirm")
+      refute has_element?(lv, "#prune-review")
     end
 
     test "scope defaults to whole system", %{conn: conn} do
@@ -645,7 +682,7 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
       refute has_element?(lv, ~s(#prune-form select[name="prune[scope]"]))
       assert lv |> element("#prune-active-scope") |> render() =~ "Whole system"
 
-      refute has_element?(lv, "#prune-confirm")
+      refute has_element?(lv, "#prune-review")
     end
 
     test "unbounded prune shows validation error and no delete", %{conn: conn} do
@@ -670,16 +707,12 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
       assert {:ok, 1} = ClickhouseExLogger.Insert.insert([row])
       await_node_visible(node)
 
-      {:ok, lv, _html} = live(conn, ~p"/prune")
-
-      # Pushed directly: the form carries no node field, and the node under
-      # test is what the preview must be bounded for.
-      render_submit(lv, "preview", %{
-        "prune" => %{scope: "node", node: node, level: "all"}
-      })
+      # The scope travels in the URL, since the form carries no node field,
+      # and the node under test is what the scope must be bounded for.
+      {:ok, lv, _html} = live(conn, "/prune?scope=node&node=#{node}")
 
       assert has_element?(lv, "#prune-error")
-      refute has_element?(lv, "#prune-confirm")
+      refute has_element?(lv, "#prune-review")
       assert lv |> element("#prune-error") |> render() =~ "from"
 
       require Ash.Query
@@ -693,7 +726,7 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
       assert count == 1
     end
 
-    test "preview then cancel deletes zero rows", %{conn: conn} do
+    test "review then cancel deletes zero rows", %{conn: conn} do
       node = "prune-ui-#{System.system_time(:millisecond)}-#{:rand.uniform(1_000_000)}@host"
       now = DateTime.truncate(DateTime.utc_now(), :microsecond)
 
@@ -713,19 +746,17 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
       assert {:ok, 1} = ClickhouseExLogger.Insert.insert([row])
       await_node_visible(node)
 
-      {:ok, lv, _html} = live(conn, ~p"/prune")
+      # The node travels in the URL, not the form, because badges own the
+      # scope and the form carries no node field.
+      {:ok, lv, _html} = live(conn, "/prune?scope=node&node=#{node}&from=2000-01-01T00:00:00Z")
 
-      # Pushed directly: the node travels in the event, not the form, because
-      # badges own the scope and the form carries no node field.
-      render_submit(lv, "preview", %{"prune" => prune_attrs(node)})
-
-      assert has_element?(lv, "#prune-confirm")
+      assert has_element?(lv, "#prune-review")
 
       lv
       |> element("#prune-cancel-button")
       |> render_click()
 
-      refute has_element?(lv, "#prune-confirm")
+      refute has_element?(lv, "#prune-review")
       refute has_element?(lv, "#prune-result")
 
       require Ash.Query
@@ -739,7 +770,7 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
       assert count == 1
     end
 
-    test "preview then confirm dispatches prune", %{conn: conn} do
+    test "review then confirm dispatches prune", %{conn: conn} do
       node = "prune-ui-#{System.system_time(:millisecond)}-#{:rand.uniform(1_000_000)}@host"
       now = DateTime.truncate(DateTime.utc_now(), :microsecond)
 
@@ -759,13 +790,11 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
       assert {:ok, 1} = ClickhouseExLogger.Insert.insert([row])
       await_node_visible(node)
 
-      {:ok, lv, _html} = live(conn, ~p"/prune")
+      # The node travels in the URL, not the form, because badges own the
+      # scope and the form carries no node field.
+      {:ok, lv, _html} = live(conn, "/prune?scope=node&node=#{node}&from=2000-01-01T00:00:00Z")
 
-      # Pushed directly: the node travels in the event, not the form, because
-      # badges own the scope and the form carries no node field.
-      render_submit(lv, "preview", %{"prune" => prune_attrs(node)})
-
-      assert has_element?(lv, "#prune-confirm")
+      assert has_element?(lv, "#prune-review")
 
       lv
       |> element("#prune-confirm-button")
@@ -774,12 +803,12 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
       assert has_element?(lv, "#prune-result")
     end
 
-    test "confirming without a preview deletes nothing", %{conn: conn} do
+    test "confirming without a review deletes nothing", %{conn: conn} do
       {:ok, lv, _html} = live(conn, ~p"/prune")
 
-      # The confirm button is absent until a preview is pending, so the event is
-      # pushed directly. It must refuse rather than delete whatever the form
-      # currently holds.
+      # The confirm button is absent until a review is on screen, so the event
+      # is pushed directly. It must refuse rather than delete whatever the
+      # scope currently holds.
       render_click(lv, "confirm", %{})
 
       assert has_element?(lv, "#prune-error")
@@ -846,7 +875,7 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
     test "a saved policy is shown as one that survives a restart", %{conn: conn} do
       {:ok, lv, _html} = live(conn, ~p"/prune")
 
-      save_enabled(lv, %{enabled: "true", run_at: "04:00 UTC", keep: "12h"})
+      save_enabled(lv, %{enabled: "true", keep: "12h"})
 
       # The source is stated rather than implied: a saved policy and a configured one
       # are indistinguishable until the operator needs to know which will still be
@@ -858,14 +887,17 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
       effective = lv |> element("#retention-effective") |> render()
 
       assert effective =~ "12h"
-      assert effective =~ "04:00"
+      # An hour-valued age runs every hour, so the description names the cadence
+      # and no time of day — the run time does not govern this cadence.
+      assert effective =~ "every hour"
+      refute effective =~ "04:00"
     end
 
     test "the two sources render differently", %{conn: conn} do
       {:ok, lv, _html} = live(conn, ~p"/prune")
       configured_source = lv |> element("#retention-source") |> render()
 
-      save_enabled(lv, %{enabled: "true", run_at: "04:00 UTC", keep: "12h"})
+      save_enabled(lv, %{enabled: "true", keep: "12h"})
 
       refute configured_source == lv |> element("#retention-source") |> render()
     end
@@ -876,6 +908,9 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
       save_enabled(lv, %{enabled: "true", run_at: "05:00 UTC", keep: "30d"})
 
       assert lv |> element("#retention-effective") |> render() =~ "30d"
+      # A day-valued age still names its run time: the cadence it governs did
+      # not change.
+      assert lv |> element("#retention-effective") |> render() =~ "once a day at 05:00 UTC"
 
       assert {:ok, report} = Scheduler.effective_policy()
       assert report.policy == %Policy{enabled: true, run_at: {"05:00", "UTC"}, keep: "30d"}
@@ -904,7 +939,7 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
 
       {:ok, lv, _html} = live(conn, ~p"/prune")
 
-      save_enabled(lv, %{enabled: "true", run_at: "05:00 UTC", keep: "1h"})
+      save_enabled(lv, %{enabled: "true", keep: "1h"})
 
       assert lv |> element("#retention-effective") |> render() =~ "1h"
 
@@ -1086,7 +1121,7 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
       {:ok, lv, _html} = live(conn, ~p"/prune")
 
       lv
-      |> form("#retention-form", retention: %{enabled: "true", run_at: "04:00 UTC", keep: "1h"})
+      |> form("#retention-form", retention: %{enabled: "true", keep: "1h"})
       |> render_submit()
 
       assert has_element?(lv, "#retention-confirm")
@@ -1109,7 +1144,7 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
       {:ok, lv, _html} = live(conn, ~p"/prune")
 
       lv
-      |> form("#retention-form", retention: %{enabled: "true", run_at: "04:00 UTC", keep: "1h"})
+      |> form("#retention-form", retention: %{enabled: "true", keep: "1h"})
       |> render_submit()
 
       lv |> element("#retention-confirm-button") |> render_click()
@@ -1121,7 +1156,7 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
       # making an operator confirm a stop would only add friction where there is no
       # risk — and stopping a policy you regret is the urgent case.
       lv
-      |> form("#retention-form", retention: %{enabled: "false", run_at: "04:00 UTC", keep: "1h"})
+      |> form("#retention-form", retention: %{enabled: "false", keep: "1h"})
       |> render_submit()
 
       refute has_element?(lv, "#retention-confirm")
@@ -1137,7 +1172,7 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
       {:ok, lv, _html} = live(conn, ~p"/prune")
 
       lv
-      |> form("#retention-form", retention: %{enabled: "true", run_at: "04:00 UTC", keep: "1h"})
+      |> form("#retention-form", retention: %{enabled: "true", keep: "1h"})
       |> render_submit()
 
       lv |> element("#retention-confirm-button") |> render_click()
@@ -1148,6 +1183,81 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
 
       assert {:ok, %{policy: %Policy{enabled: false}, source: :configured}} =
                Scheduler.effective_policy()
+    end
+
+    test "the run-at field is offered for a day-valued age and not for an hour-valued one", %{
+      conn: conn
+    } do
+      {:ok, lv, _html} = live(conn, ~p"/prune")
+
+      # The default keep is 7d, so the run time is part of what the form submits.
+      assert has_element?(lv, "#retention_run_at")
+
+      # Selecting an hour-valued age hides it: that cadence fires on the hour,
+      # and offering a control the schedule ignores would invite operators to
+      # care about a value that selects nothing.
+      lv
+      |> form("#retention-form", retention: %{enabled: "true", keep: "1h"})
+      |> render_change()
+
+      refute has_element?(lv, "#retention_run_at")
+
+      # And selecting a day-valued age again brings it back, with the value the
+      # policy in force carried rather than one the hour-valued form emptied.
+      lv
+      |> form("#retention-form", retention: %{enabled: "true", keep: "7d"})
+      |> render_change()
+
+      assert has_element?(lv, "#retention_run_at")
+    end
+
+    test "arming an hour-valued age keeps the previously held run time", %{conn: conn} do
+      configure(%{"enabled" => "false", "run_at" => "05:00 UTC", "keep" => "7d"})
+
+      {:ok, lv, _html} = live(conn, ~p"/prune")
+
+      # The hour-valued form submits no run-at field. Saving must not reset the
+      # 05:00 the configured day policy holds to the default: the field says
+      # nothing about an hourly cadence, and this value is what the operator
+      # comes back to when they pick a day-valued age again.
+      render_submit(lv, "retention_apply", %{
+        "retention" => %{"enabled" => "true", "keep" => "1h"}
+      })
+
+      lv |> element("#retention-confirm-button") |> render_click()
+
+      assert {:ok, params} = Store.get(Policy, :policy)
+      assert params["keep"] == "1h"
+      assert params["run_at"] == "05:00 UTC"
+    end
+
+    test "the confirmation states the cadence the armed schedule will run at", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/prune")
+
+      # A day-valued age keeps naming its run time: the cadence is once a day,
+      # and the time governs it.
+      lv
+      |> form("#retention-form", retention: %{enabled: "true", run_at: "05:00 UTC", keep: "7d"})
+      |> render_submit()
+
+      scope = lv |> element("#retention-confirm-scope") |> render()
+
+      assert scope =~ "once a day at 05:00 UTC"
+
+      lv |> element("#retention-cancel-button") |> render_click()
+
+      # Arming an hourly policy is a far bigger commitment than arming a daily
+      # one, so the confirmation names which one will run rather than implying
+      # a daily delete from whatever time of day the policy holds.
+      lv
+      |> form("#retention-form", retention: %{enabled: "true", keep: "12h"})
+      |> render_submit()
+
+      scope = lv |> element("#retention-confirm-scope") |> render()
+
+      assert scope =~ "12h"
+      assert scope =~ "every hour"
+      refute scope =~ "at 0"
     end
 
     test "an invalid run time is rejected and names the remedy", %{conn: conn} do
@@ -1243,14 +1353,5 @@ defmodule LoggerDashboardWeb.PruneLiveTest do
     end)
 
     :ok
-  end
-
-  defp prune_attrs(node) do
-    %{
-      scope: "node",
-      node: node,
-      level: "all",
-      from: "2000-01-01T00:00:00Z"
-    }
   end
 end

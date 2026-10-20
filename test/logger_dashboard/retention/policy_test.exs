@@ -223,8 +223,65 @@ defmodule LoggerDashboard.Retention.PolicyTest do
       assert text =~ "every node"
     end
 
+    test "a day-valued age states the daily run at the policy's time" do
+      text = Policy.describe(%Policy{enabled: true, run_at: {"03:00", "UTC"}, keep: "7d"})
+
+      assert text =~ "once a day at 03:00 UTC"
+    end
+
+    test "an hour-valued age states the hourly cadence and no time of day" do
+      # The time of day does not run an hour-valued age, so naming it would
+      # describe a schedule that does not exist.
+      text = Policy.describe(%Policy{enabled: true, run_at: {"03:00", "UTC"}, keep: "1h"})
+
+      assert text =~ "every hour"
+      refute text =~ "03:00"
+    end
+
     test "says so when the policy is disabled" do
       assert Policy.describe(Policy.default()) =~ "disabled"
+    end
+  end
+
+  describe "cadence/1" do
+    test "an hour-valued age is hourly" do
+      for keep <- ["1h", "6h", "12h"] do
+        policy = %Policy{enabled: true, run_at: {"03:00", "UTC"}, keep: keep}
+
+        assert Policy.cadence(policy) == :hourly
+      end
+    end
+
+    test "a day-valued age is daily" do
+      for keep <- ["1d", "3d", "7d", "30d", "90d"] do
+        policy = %Policy{enabled: true, run_at: {"03:00", "UTC"}, keep: keep}
+
+        assert Policy.cadence(policy) == :daily
+      end
+    end
+
+    test "a keep outside the family falls back to daily" do
+      # Not a value build/1 accepts, but a policy handed in through the store or
+      # config must degrade to today's schedule rather than raise.
+      policy = %Policy{enabled: true, run_at: {"03:00", "UTC"}, keep: "99y"}
+
+      assert Policy.cadence(policy) == :daily
+    end
+  end
+
+  describe "keep_cadence/1" do
+    test "derives the cadence from the age id's unit" do
+      for keep <- ["1h", "6h", "12h"] do
+        assert Policy.keep_cadence(keep) == :hourly
+      end
+
+      for keep <- ["1d", "3d", "7d", "30d", "90d"] do
+        assert Policy.keep_cadence(keep) == :daily
+      end
+    end
+
+    test "an id outside the family falls back to daily" do
+      assert Policy.keep_cadence("not-an-age") == :daily
     end
   end
 

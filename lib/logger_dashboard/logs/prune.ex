@@ -7,6 +7,12 @@ defmodule LoggerDashboard.Logs.Prune do
   `ash_clickhouse 0.7.3`. Predicates are built only from validated filter
   fields (node/level/timestamp) with bound parameters; no user SQL is
   interpolated.
+
+  `review/1` describes what a confirmed prune would delete: the matching-row
+  count, how those rows are spread across the nodes in scope, and a bounded
+  sample of the newest ones. It reads through the same validated filter the
+  delete executes, so the numbers a review states are the numbers the delete
+  acts on.
   """
 
   alias LoggerDashboard.Logs.Filter
@@ -100,24 +106,29 @@ defmodule LoggerDashboard.Logs.Prune do
   end
 
   @doc """
-  Describe what a confirmed prune would delete: the exact matching-row count
-  plus a bounded sample of the newest matching rows.
+  Describe what a confirmed prune would delete: the exact matching-row count,
+  how those rows are distributed across nodes, and a bounded sample of the
+  newest matching rows.
 
   Reads through the same validated filter the delete executes — `parse/1`
   already folds scope in and forces `search: ""`, so `Filter.predicates/1` here
   emits exactly the predicates `run/2` will delete against. That is what makes
-  the number a preview states the number the delete acts on.
+  the numbers a review states the numbers the delete acts on.
 
-  Returns `{:ok, %{count: non_neg_integer(), rows: [map()]}}` or
-  `{:error, term()}`. A failed read surfaces as an error rather than as a zero
-  count, because a destructive confirmation must not understate its scope.
+  Returns `{:ok, %{count: non_neg_integer(), nodes: [{String.t(), count}], rows: [map()]}}`
+  or `{:error, term()}`. A failed read surfaces as an error rather than as a
+  zero count, because a destructive confirmation must not understate its
+  scope.
   """
-  @spec preview(Filter.t()) ::
-          {:ok, %{count: non_neg_integer(), rows: [map()]}} | {:error, term()}
-  def preview(%Filter{} = filter) do
+  @spec review(Filter.t()) ::
+          {:ok,
+           %{count: non_neg_integer(), nodes: [{String.t(), non_neg_integer()}], rows: [map()]}}
+          | {:error, term()}
+  def review(%Filter{} = filter) do
     with {:ok, count} <- LogRead.count_logs(filter),
+         {:ok, nodes} <- LogRead.count_by_node(filter),
          {:ok, rows, _has_more} <- LogRead.list_logs(filter, limit: @preview_sample_limit) do
-      {:ok, %{count: count, rows: rows}}
+      {:ok, %{count: count, nodes: nodes, rows: rows}}
     end
   end
 

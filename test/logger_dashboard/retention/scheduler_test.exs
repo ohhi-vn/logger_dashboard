@@ -339,6 +339,56 @@ defmodule LoggerDashboard.Retention.SchedulerTest do
     end
   end
 
+  describe "next_occurrence/2 with an hour-valued age" do
+    test "rolls to the top of the next hour" do
+      policy = %Policy{enabled: true, run_at: {"03:00", "UTC"}, keep: "1h"}
+      now = ~U[2026-09-02 02:17:30Z]
+
+      assert Scheduler.next_occurrence(policy, now) == ~U[2026-09-02 03:00:00Z]
+    end
+
+    test "the run time does not move an hour-valued age off the hour" do
+      # The run time governs a day-valued age only. An hour-valued one fires on
+      # the hour whatever the policy holds — the cadence is the age's, not the
+      # clock time's.
+      for keep <- ["1h", "6h", "12h"],
+          run_at <- ["03:00", "03:15", "23:45"] do
+        policy = %Policy{enabled: true, run_at: {run_at, "UTC"}, keep: keep}
+        now = ~U[2026-09-02 10:17:42Z]
+
+        assert Scheduler.next_occurrence(policy, now) == ~U[2026-09-02 11:00:00Z]
+      end
+    end
+
+    test "rolls past the day as well as the hour" do
+      policy = %Policy{enabled: true, run_at: {"03:00", "UTC"}, keep: "6h"}
+      now = ~U[2026-09-02 23:30:00Z]
+
+      assert Scheduler.next_occurrence(policy, now) == ~U[2026-09-03 00:00:00Z]
+    end
+
+    test "keeps the daily branch intact for a day-valued age" do
+      policy = %Policy{enabled: true, run_at: {"03:15", "UTC"}, keep: "30d"}
+      now = ~U[2026-09-02 23:30:00Z]
+
+      assert Scheduler.next_occurrence(policy, now) == ~U[2026-09-03 03:15:00Z]
+    end
+
+    test "always returns a strictly future instant for an hour-valued age" do
+      # An instant exactly on the hour is the occurrence just gone; the next one
+      # is the following hour, the same rule the daily cadence applies at its run
+      # time.
+      policy = %Policy{enabled: true, run_at: {"03:00", "UTC"}, keep: "12h"}
+
+      for minute <- 0..59, second <- [0, 37] do
+        at = %{~U[2026-09-02 10:00:00Z] | minute: minute, second: second, microsecond: {0, 0}}
+        next = Scheduler.next_occurrence(policy, at)
+
+        assert DateTime.compare(next, at) == :gt
+      end
+    end
+  end
+
   describe "time_until_next/1" do
     test "is :none for a disabled policy" do
       assert Scheduler.time_until_next(Policy.default()) == :none
@@ -352,6 +402,18 @@ defmodule LoggerDashboard.Retention.SchedulerTest do
       assert is_integer(delay)
       assert delay > 0
       assert delay <= 24 * 60 * 60 * 1000
+    end
+
+    test "is within an hour for an hour-valued age" do
+      # The cadence the age implies is hourly, so the delay to the next run is
+      # bounded by the hour regardless of what run time the policy holds.
+      policy = %Policy{enabled: true, run_at: {"03:00", "UTC"}, keep: "6h"}
+
+      delay = Scheduler.time_until_next(policy)
+
+      assert is_integer(delay)
+      assert delay > 0
+      assert delay <= 60 * 60 * 1000
     end
   end
 
@@ -408,6 +470,42 @@ defmodule LoggerDashboard.Retention.SchedulerTest do
         end)
 
       refute log =~ "[retention] unattended prune"
+    end
+
+    test "a stored enabled hour-valued policy boots inert and schedules under an hour out" do
+      # The hourly cadence changes how often an armed policy fires, not whether
+      # boot is allowed to fire it: a restart must mean the same thing for a
+      # policy that runs every hour as for one that runs once a day.
+      configure(%{"enabled" => "false", "run_at" => "03:00 UTC", "keep" => "7d"})
+
+      :ok =
+        Store.put(
+          Policy,
+          :policy,
+          Policy.to_params(%Policy{enabled: true, run_at: {"03:00", "UTC"}, keep: "1h"})
+        )
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          name = fresh_name()
+          start_scheduler(name: name)
+
+          assert %{timer: timer, report: %{policy: policy, source: :stored}} =
+                   :sys.get_state(name)
+
+          assert is_reference(timer)
+          assert policy.keep == "1h"
+        end)
+
+      refute log =~ "[retention] unattended prune"
+
+      # And the delay it armed is bounded by the hour the age implies, not by
+      # tomorrow's run time.
+      assert Scheduler.time_until_next(%Policy{
+               enabled: true,
+               run_at: {"03:00", "UTC"},
+               keep: "1h"
+             }) <= 60 * 60 * 1000
     end
 
     test "a disabled policy schedules no timer at all", ctx do

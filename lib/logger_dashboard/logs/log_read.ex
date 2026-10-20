@@ -107,6 +107,56 @@ defmodule LoggerDashboard.Logs.LogRead do
     count_result(ClickhouseExLogger.Repo.query(sql, params))
   end
 
+  @doc """
+  Count the rows matching `filter` per node, largest first.
+
+  Reads through the same `Filter.predicates/1` clause and bound parameters as
+  `list_logs/2` and `count_logs/1`, so the distribution describes the same
+  filter set those do. A row with no node is counted under an explicit
+  `unknown` group rather than dropped, because a delete would remove it too.
+
+  Bounded by `limit`, so a large fleet cannot inflate the answer: the busiest
+  nodes are the ones an operator needs to see.
+  """
+  @spec count_by_node(Filter.t(), pos_integer()) ::
+          {:ok, [{String.t(), non_neg_integer()}]} | {:error, term()}
+  def count_by_node(%Filter{} = filter, limit \\ 50) do
+    {where, params} = Filter.predicates(filter)
+    node = AshClickhouse.Identifier.quote_name(:node)
+
+    sql = """
+    SELECT #{node}, COUNT(*) AS count
+    FROM #{table()}
+    WHERE #{where}
+    GROUP BY #{node}
+    ORDER BY count DESC
+    LIMIT ?
+    """
+
+    case ClickhouseExLogger.Repo.query(sql, params ++ [limit]) do
+      {:ok, %{rows: rows}} when is_list(rows) ->
+        counts =
+          for [value, count] <- rows,
+              is_integer(count),
+              do: {normalize_node(value), count}
+
+        {:ok, counts}
+
+      {:ok, _other} ->
+        {:error, @unrecognized_response_format}
+
+      {:error, error} ->
+        {:error, error}
+    end
+  end
+
+  # A row with no node is a row nonetheless, so it is counted under an
+  # explicit name rather than lost.
+  defp normalize_node(nil), do: "unknown"
+  defp normalize_node(""), do: "unknown"
+  defp normalize_node("nil"), do: "unknown"
+  defp normalize_node(value), do: to_string(value)
+
   @doc false
   @spec count_result(term()) :: {:ok, non_neg_integer()} | {:error, term()}
   def count_result({:ok, %{rows: [[count]]}}) when is_integer(count), do: {:ok, count}

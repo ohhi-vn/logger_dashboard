@@ -117,7 +117,9 @@ Spacing between and within rows SHALL be tight enough that the rows in a page ar
 
 ### Requirement: Wildcard text search
 
-The system SHALL support wildcard text search over `message` (e.g. `*timeout*`, `db_*`) translated to a ClickHouse `LIKE`/`match` predicate. The predicate SHALL be evaluated by the database against every row in the active scope, not applied in application memory to a bounded subset.
+The system SHALL support wildcard text search over `message` (e.g. `*timeout*`, `db_*`) translated to a ClickHouse case-insensitive `LIKE`/`match` predicate. The predicate SHALL be evaluated by the database against every row in the active scope, not applied in application memory to a bounded subset.
+
+A search MAY carry several space-separated terms, and a row matches the search only when it matches every term. A term that carries a wildcard SHALL be matched as written; a term with no wildcard SHALL match anywhere in the message. Matching SHALL ignore letter case, so a term matches regardless of the case used in the message. A search whose wildcards span the whole string SHALL be matched as one pattern, so the spaces inside it are literal. An empty search SHALL continue to apply no message predicate.
 
 #### Scenario: Wildcard search filters rows
 
@@ -138,6 +140,36 @@ The system SHALL support wildcard text search over `message` (e.g. `*timeout*`, 
 
 - **WHEN** user enters a search pattern together with a node scope, datetime range, and level
 - **THEN** system applies the message pattern only to rows already matching that scope, range, and level
+
+#### Scenario: Search ignores letter case
+
+- **WHEN** user enters `Timeout` and a row's message reads `connection timeout`
+- **THEN** that row matches the search
+
+#### Scenario: Several terms are combined with AND
+
+- **WHEN** user enters `*timeout* *db*`
+- **THEN** system returns only rows whose message matches both terms, not rows matching either one alone
+
+#### Scenario: Each term keeps the wildcard syntax
+
+- **WHEN** user enters `*timeout* db_*`
+- **THEN** the first term matches any run of characters and the second matches a run beginning with `db`
+
+#### Scenario: A wildcard search keeps its meaning
+
+- **WHEN** user enters one wildcard term
+- **THEN** the rows returned are the same rows that term returned before, apart from the comparison no longer depending on letter case
+
+#### Scenario: A term without a wildcard matches anywhere in the message
+
+- **WHEN** user enters `timeout`
+- **THEN** system returns the rows whose message contains `timeout`, not only the rows whose message is exactly `timeout`
+
+#### Scenario: A search whose wildcards span the whole string is one pattern
+
+- **WHEN** user enters `*logtotal row 2*`
+- **THEN** system returns the rows whose message contains that phrase, spaces included
 
 ### Requirement: Datetime-range filter
 
@@ -372,7 +404,8 @@ The system SHALL accept a node scope of zero, one, or more node names selected o
 - **THEN** every node value travels through the `node` URL param and bound parameters, and no raw node text reaches the SQL string
 
 ### Requirement: Distinct node options
-The system SHALL list the distinct node values present in the shared `logs` table as selectable options for the node filter. The list SHALL reflect nodes recently observed in the table, SHALL be ordered for scanning, and SHALL exclude no node merely because it is absent from the current page of rows.
+
+The system SHALL list the distinct node values present in the shared `logs` table as selectable options for the node filter, together with every node in the active scope. The list SHALL reflect nodes recently observed in the table, SHALL be ordered for scanning, and SHALL exclude no node merely because it is absent from the current page of rows. A node in the active scope that is not among the known node values SHALL be offered ahead of them, so that the scope is visible and removable through the options.
 
 #### Scenario: Known nodes are offered as options
 - **WHEN** the table contains rows from `my_app@10.0.0.5` and `my_app@10.0.0.6`
@@ -385,6 +418,10 @@ The system SHALL list the distinct node values present in the shared `logs` tabl
 #### Scenario: Empty table offers no node options
 - **WHEN** the table holds no rows with a node value
 - **THEN** system offers no node options and the scope remains whole-system with select-all and clear actions hidden or disabled
+
+#### Scenario: An active node outside the known node list is offered ahead of them
+- **WHEN** the active scope names a node that is not among the known node values
+- **THEN** the node options offer that node first, marked as in scope, so it can be seen and removed
 
 ### Requirement: Export the current page as raw text
 
@@ -553,3 +590,19 @@ The system SHALL apply Logs filter changes immediately through the URL params wi
 #### Scenario: Rejected filter still shows its error with no total
 - **WHEN** an auto-applied filter is rejected
 - **THEN** system shows the validation error naming the field and shows no stale total or stale rows
+
+### Requirement: The viewer presents the shared filter controls
+
+The Logs page SHALL present its node scope, level scope, and search through the same shared controls the Analysis and Prune pages use, and SHALL NOT present a second, page-specific variant of any of them. The viewer's own controls — the per-page row count and the refresh action — SHALL remain on the page and SHALL continue to work as they do today.
+
+#### Scenario: No duplicate node or level control on the viewer
+- **WHEN** user views the Logs page filter
+- **THEN** exactly one node scope control and exactly one level scope control are present
+
+#### Scenario: The viewer's search states the shared syntax
+- **WHEN** user views the search control on the Logs page
+- **THEN** it states the same wildcard, case-insensitivity, and multi-term syntax the Analysis page states
+
+#### Scenario: The viewer's own controls are unaffected
+- **WHEN** user changes the per-page row count or triggers Refresh on the Logs page
+- **THEN** the page behaves as it does today, showing the newest matching rows for the active filter set

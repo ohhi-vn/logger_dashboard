@@ -319,6 +319,62 @@ defmodule LoggerDashboard.Logs.LogReadTest do
     end
   end
 
+  describe "count_by_node/2" do
+    setup do
+      stamp = System.system_time(:millisecond)
+      first = "pernode-a-#{stamp}-#{:rand.uniform(1_000_000)}@host"
+      second = "pernode-b-#{stamp}-#{:rand.uniform(1_000_000)}@host"
+      on_exit(fn -> Enum.each([first, second], &delete_tag/1) end)
+      %{first: first, second: second}
+    end
+
+    test "counts the rows of each node, busiest first", %{first: first, second: second} do
+      seed(first, "per node one", :info, ~U[2026-01-01 00:00:00.000000Z])
+      seed(first, "per node two", :info, ~U[2026-01-02 00:00:00.000000Z])
+      seed(second, "per node three", :info, ~U[2026-01-03 00:00:00.000000Z])
+
+      assert {:ok, counts} =
+               LogRead.count_by_node(%Filter{nodes: [first, second]})
+
+      assert counts == [{first, 2}, {second, 1}]
+    end
+
+    test "counts a row with no node under an explicit name", %{first: first} do
+      # A row with no node is a row nonetheless, and a whole-system prune
+      # would remove it too, so it is counted rather than lost.
+      token = "pernode#{System.unique_integer([:positive])}"
+
+      row = %{
+        id: Ash.UUID.generate(),
+        timestamp: ~U[2026-01-01 00:00:00.000000Z],
+        level: "info",
+        message: "#{token} unknown",
+        module: "Test",
+        file: nil,
+        line: nil,
+        function: nil,
+        metadata: %{},
+        node: nil
+      }
+
+      {:ok, 1} = ClickhouseExLogger.Insert.insert([row])
+      seed(first, "#{token} known", :info, ~U[2026-01-02 00:00:00.000000Z])
+
+      on_exit(fn ->
+        ClickhouseExLogger.Repo.query("DELETE FROM logs WHERE message LIKE ?", ["%#{token}%"])
+      end)
+
+      # The scope is the token, so the read is not competing with the rest of
+      # the table for the bounded number of groups it reports.
+      # Async insert: the row is not readable the moment it is accepted, so
+      # the assertion waits for it rather than sleeping for a fixed time.
+      counts = await_unknown_node(token, 20)
+
+      assert {"unknown", 1} in counts
+      assert {first, 1} in counts
+    end
+  end
+
   describe "list_nodes/1" do
     test "returns distinct ordered nodes and excludes null and empty" do
       stamp = System.system_time(:millisecond)
@@ -368,6 +424,29 @@ defmodule LoggerDashboard.Logs.LogReadTest do
 
   defp delete_tag(tag) do
     ClickhouseExLogger.Repo.query("DELETE FROM logs WHERE node = ?", [tag])
+  end
+
+  # Polls the per-node counts until a row with no node shows up in them.
+  defp await_unknown_node(token, attempts) do
+    case LogRead.count_by_node(%Filter{search: token}) do
+      {:ok, counts} ->
+        if Enum.any?(counts, fn {node, _count} -> node == "unknown" end) do
+          counts
+        else
+          retry_unknown_node(token, attempts, counts)
+        end
+
+      _other ->
+        retry_unknown_node(token, attempts, [])
+    end
+  end
+
+  defp retry_unknown_node(_token, 0, _counts),
+    do: flunk("the row with no node never became visible")
+
+  defp retry_unknown_node(token, attempts, _counts) do
+    Process.sleep(250)
+    await_unknown_node(token, attempts - 1)
   end
 
   # `ClickhouseExLogger.Insert` writes with async insert, so a node accepted by

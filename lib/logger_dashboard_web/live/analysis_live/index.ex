@@ -7,7 +7,18 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
   alias LoggerDashboard.Logs.Filter
   alias LoggerDashboard.Logs.LogRead
 
-  @filter_keys ["node", "search", "from", "to", "preset", "level", "bucket"]
+  @filter_keys [
+    "node",
+    "search",
+    "from",
+    "to",
+    "preset",
+    "level",
+    "bucket",
+    "level_chart",
+    "volume_chart",
+    "node_chart"
+  ]
 
   @impl true
   def mount(_params, _session, socket) do
@@ -23,6 +34,7 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
       |> assign(:volume, nil)
       |> assign(:nodes, nil)
       |> assign(:charts, %{})
+      |> assign(:chart_styles, Analysis.default_chart_styles())
       |> assign(:applied_limit, Analysis.applied_limit(limit: 1_000))
       |> assign(:analysis_error, nil)
       |> assign(:filter_error, nil)
@@ -65,7 +77,7 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
         # Built from the parsed filter so the inputs show the values actually
         # applied, including the instants a `preset` resolved to.
         |> assign(:form, to_form(form_params(filter, bucket), as: :filters))
-        |> load_analysis(filter, bucket)
+        |> load_analysis(filter, bucket, requested_chart_styles(filter_params))
         |> load_node_options()
 
       {:error, message} ->
@@ -137,64 +149,36 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
 
   @impl true
   def handle_event("toggle-node", %{"node" => node}, socket) do
-    # Same toggle shape as the logs page: read the scope back from the URL
-    # params so the toggle works while a validation error is shown, and write
-    # back through the same `node` param so parsing stays the single
-    # validator. Range, level, and bucket ride along untouched.
-    case String.trim(to_string(node)) do
-      "" ->
-        {:noreply, socket}
+    # The same toggle the viewer uses, and for the same reason: `Filter` owns
+    # the `node` param's format, so the two pages cannot drift apart on how a
+    # scope is written down. Range, level, and bucket ride along untouched.
+    params = Filter.toggle_node(socket.assigns.filter_params, node)
 
-      name ->
-        nodes = Filter.parse_nodes(socket.assigns.filter_params)
-
-        nodes =
-          if name in nodes,
-            do: Enum.reject(nodes, &(&1 == name)),
-            else: Enum.uniq(nodes ++ [name])
-
-        params =
-          case Filter.nodes_to_param(nodes) do
-            "" -> Map.delete(socket.assigns.filter_params, "node")
-            param -> Map.put(socket.assigns.filter_params, "node", param)
-          end
-
-        {:noreply, push_patch(socket, to: ~p"/analysis?#{params}")}
-    end
+    {:noreply, push_patch(socket, to: ~p"/analysis?#{params}")}
   end
 
   @impl true
   def handle_event("select-level", %{"level" => level}, socket) do
     # Toggle through the same `level` param the form submits, mirroring the
-    # Logs page: read the set back from the URL params so the toggle works
-    # while a validation error is shown. An unknown level is ignored here;
-    # hand-typed values travel the form path where `Filter.parse/1` reports
-    # them.
-    level = level |> to_string() |> String.trim() |> String.downcase()
+    # Logs page. An unknown level is ignored here; hand-typed values travel
+    # the form path where `Filter.parse/1` reports them.
+    params = Filter.toggle_level(socket.assigns.filter_params, level)
 
-    cond do
-      level == "all" ->
-        params = Map.delete(socket.assigns.filter_params, "level")
-        {:noreply, push_patch(socket, to: ~p"/analysis?#{params}")}
+    {:noreply, push_patch(socket, to: ~p"/analysis?#{params}")}
+  end
 
-      level in Filter.level_values() ->
-        levels = selected_levels(socket.assigns.filter_params)
-
-        levels =
-          if level in levels,
-            do: Enum.reject(levels, &(&1 == level)),
-            else: levels ++ [level]
-
-        params =
-          case Filter.levels_to_param(levels) do
-            "" -> Map.delete(socket.assigns.filter_params, "level")
-            param -> Map.put(socket.assigns.filter_params, "level", param)
-          end
-
-        {:noreply, push_patch(socket, to: ~p"/analysis?#{params}")}
-
-      true ->
+  @impl true
+  def handle_event("chart-style", %{"breakdown" => breakdown, "style" => style}, socket) do
+    # The style travels in the URL, so a shared link reproduces the same
+    # charts. The style the data can take is resolved on the next render, and
+    # the control shows the one in use.
+    case Analysis.chart_param(breakdown) do
+      nil ->
         {:noreply, socket}
+
+      param ->
+        params = Map.put(socket.assigns.filter_params, param, style)
+        {:noreply, push_patch(socket, to: ~p"/analysis?#{params}")}
     end
   end
 
@@ -267,20 +251,30 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
   # produced it can never render misaligned cells.
   defp row_values([_label | values], headers), do: Enum.zip(headers, values)
 
-  defp load_analysis(socket, filter, bucket) do
+  defp load_analysis(socket, filter, bucket, chart_styles) do
     limit = 1_000
     opts = [limit: limit, split_by_level: true]
 
     with {:ok, levels} <- Analysis.level_frequency(filter, limit: limit),
          {:ok, volume} <- Analysis.volume_over_time(filter, bucket, opts),
          {:ok, nodes} <- Analysis.node_frequency(filter, limit: limit) do
+      {level_chart, level_style} = chart_for(levels, chart_styles[:level])
+      {volume_chart, volume_style} = chart_for(volume, chart_styles[:volume])
+      {node_chart, node_style} = chart_for(nodes, chart_styles[:node])
+
       socket
       |> assign(:levels, levels)
       |> assign(:volume, volume)
       |> assign(:nodes, nodes)
       |> assign(:charts, %{
-        level: AshDyan.Charts.to_chartjs(levels),
-        volume: AshDyan.Charts.to_chartjs(volume)
+        level: level_chart,
+        volume: volume_chart,
+        node: node_chart
+      })
+      |> assign(:chart_styles, %{
+        level: level_style,
+        volume: volume_style,
+        node: node_style
       })
       |> assign(:applied_limit, Analysis.applied_limit(opts))
       |> assign(:analysis_error, nil)
@@ -291,6 +285,52 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
         |> assign(:analysis_error, ClickHouseError.friendly(error))
     end
   end
+
+  # The chart config for a result, and the style it was actually drawn in.
+  #
+  # A style the result's shape cannot take — a pie of a multi-series
+  # result, say — falls back to the recommended one, and the control shows
+  # the style in use rather than the one that was asked for. The chart data is
+  # the same either way: the style changes the drawing, not the numbers.
+  defp chart_for(nil, _style), do: {nil, nil}
+
+  defp chart_for(result, style) do
+    case AshDyan.Charts.to_chartjs(result, style) do
+      {:error, _reason} ->
+        fallback = AshDyan.Charts.recommend(result)
+        {framed_chart(AshDyan.Charts.to_chartjs(result, fallback)), fallback}
+
+      config ->
+        {framed_chart(config), style}
+    end
+  end
+
+  # The chart options this page's frames need, applied to a config.
+  #
+  # `maintainAspectRatio: false` is what makes the chart fill the fixed-height
+  # frame it is drawn in. Chart.js otherwise keeps its default and derives the
+  # canvas height from the container's *width*, so a chart in a wide column
+  # draws taller than the same chart in a narrow one and the three breakdown
+  # cards stop lining up.
+  #
+  # The option is merged here, in the one place that assembles the config, so
+  # all three breakdowns get it alike. `AshDyan.Charts` builds a config from a
+  # result and has no opinion about how this page frames it.
+  defp framed_chart(config) do
+    Map.update!(config, "options", &Map.put(&1, "maintainAspectRatio", false))
+  end
+
+  # The style each breakdown was asked for, resolved against the styles that
+  # breakdown can be drawn in.
+  defp requested_chart_styles(filter_params) do
+    for breakdown <- [:level, :volume, :node] do
+      {breakdown,
+       Analysis.normalize_chart_style(breakdown, Map.get(filter_params, chart_param(breakdown)))}
+    end
+    |> Map.new()
+  end
+
+  defp chart_param(breakdown), do: Analysis.chart_param(breakdown)
 
   # Node options describe the table, not the scope in view, so a filtered page
   # still offers every known node. A failed options read leaves an empty list
@@ -311,6 +351,7 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
     |> assign(:volume, nil)
     |> assign(:nodes, nil)
     |> assign(:charts, %{})
+    |> assign(:chart_styles, Analysis.default_chart_styles())
     |> assign(:analysis_error, nil)
   end
 
@@ -318,6 +359,12 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
   # way that let the volume table diverge from the chart beside it. `label_header`
   # names a row's first cell — `Level`, `Bucket`, `Node` — and each remaining
   # column is named by the series it came from.
+  #
+  # The region around the table bounds its height: a breakdown that reports
+  # more rows than fit scrolls inside the region instead of stretching the
+  # page, and `table-pin-rows` keeps the header row visible over the scrolled
+  # body. The bound is the same for all three, which is what makes it a rule
+  # rather than a per-table judgement.
   attr :id, :string, required: true
   attr :label_header, :string, required: true
   attr :result, :any, required: true
@@ -331,20 +378,56 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
       |> assign(:rows, rows)
 
     ~H"""
-    <table class="table table-sm mt-2" id={@id}>
-      <thead>
-        <tr>
-          <th scope="col">{@label_header}</th>
-          <th :for={name <- @headers} scope="col" data-series={name}>{name}</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr :for={row <- @rows}>
-          <th scope="row">{row_label(row)}</th>
-          <td :for={{name, value} <- row_values(row, @headers)} data-series={name}>{value}</td>
-        </tr>
-      </tbody>
-    </table>
+    <div class="mt-2 max-h-64 overflow-auto" id={"#{@id}-region"}>
+      <table class="table table-xs table-pin-rows" id={@id}>
+        <thead>
+          <tr>
+            <th scope="col">{@label_header}</th>
+            <th :for={name <- @headers} scope="col" data-series={name}>{name}</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr :for={row <- @rows}>
+            <th scope="row">{row_label(row)}</th>
+            <td :for={{name, value} <- row_values(row, @headers)} data-series={name}>{value}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    """
+  end
+
+  # The chart-style control for one breakdown: the styles that breakdown can be
+  # drawn in, with the one in use marked.
+  #
+  # The button shows the style's readable name, while its id and the value it
+  # sends are the style's machine name. The machine name is what travels in the
+  # URL, so a link keeps selecting the same chart whatever the button reads.
+  attr :id, :string, required: true
+  attr :breakdown, :atom, required: true
+  attr :style, :atom, required: true
+
+  defp chart_style(assigns) do
+    ~H"""
+    <div id={@id} class="flex flex-wrap items-center gap-1.5">
+      <span class="text-xs text-base-content/60">Style:</span>
+      <button
+        :for={style <- Analysis.chart_styles(@breakdown)}
+        type="button"
+        id={"#{@id}-#{style}"}
+        phx-click="chart-style"
+        phx-value-breakdown={Atom.to_string(@breakdown)}
+        phx-value-style={Atom.to_string(style)}
+        aria-pressed={to_string(style == @style)}
+        class={[
+          "btn btn-xs",
+          style == @style && "btn-primary",
+          style != @style && "btn-ghost border-base-300"
+        ]}
+      >
+        {Analysis.chart_style_label(style)}
+      </button>
+    </div>
     """
   end
 
@@ -359,71 +442,21 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
             System-wide or per-node aggregates. Bounded reads, disclosed limits.
           </p>
         </div>
-
-        <button
-          type="button"
-          id="analysis-clear-nodes"
-          phx-click="clear_nodes"
-          hidden={@nodes_selected == []}
-          class="btn btn-ghost btn-sm"
-        >
-          <.icon name="hero-x-mark" class="size-4" /> Clear nodes
-        </button>
       </div>
 
-      <div
-        id="analysis-active-nodes"
-        hidden={@nodes_selected == []}
-        class="flex flex-wrap items-center gap-2 text-sm"
-      >
-        <span class="text-base-content/70">Nodes:</span>
-        <span
-          :for={node <- @nodes_selected}
-          class="badge badge-outline badge-primary"
-          data-node={node}
-        >
-          {node}
-        </span>
-      </div>
-
-      <%!-- Clickable node options, sourced from the table rather than the page.
-            Badges are the only node selector: there is no free-text node
-            input. Select-all returns to whole-system scope, like clearing. --%>
-      <div id="analysis-node-options" class="flex flex-wrap items-center gap-2 text-sm">
-        <span class="text-base-content/70">All nodes:</span>
-        <button
-          :for={node <- @node_options}
-          type="button"
-          id={"analysis-node-#{Base.url_encode64(node, padding: false)}"}
-          phx-click="toggle-node"
-          phx-value-node={node}
-          data-node={node}
-          aria-pressed={to_string(node in @nodes_selected)}
-          title={
-            if node in @nodes_selected, do: "Remove #{node} from scope", else: "Add #{node} to scope"
-          }
-          class={[
-            "badge cursor-pointer border",
-            node in @nodes_selected && "badge-primary",
-            node not in @nodes_selected && "badge-outline badge-ghost hover:badge-primary"
-          ]}
-        >
-          {node}
-        </button>
-        <button
-          type="button"
-          id="analysis-select-all-nodes"
-          phx-click="select-all-nodes"
-          hidden={@nodes_selected == []}
-          title="Return to whole-system scope"
-          class="badge cursor-pointer border badge-outline badge-ghost hover:badge-primary"
-        >
-          Select all
-        </button>
-        <span :if={@node_options == []} class="text-xs text-base-content/50">
-          No known nodes.
-        </span>
-      </div>
+      <%!-- The active node scope is stated by the node options below — each
+            in-scope node appears there, marked and first — so there is no
+            second list repeating it. Two statements of one fact can disagree;
+            one cannot. --%>
+      <.node_options
+        id="analysis"
+        options={@node_options}
+        selected={@nodes_selected}
+        mode={:multi}
+        toggle_event="toggle-node"
+        select_all_event="select-all-nodes"
+        clear_event="clear_nodes"
+      />
 
       <%!-- Badge toggles, shortcuts, bucket, and selects apply immediately
             through the URL; search and bounds commit on change (debounced,
@@ -437,46 +470,40 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
         phx-debounce="400"
         class="grid grid-cols-1 gap-3 rounded-xl border border-base-300 bg-base-100 p-4 md:grid-cols-6"
       >
-        <div class="md:col-span-4">
-          <.input
-            field={@form[:search]}
-            label="Search (* wildcards)"
-            placeholder="*timeout*"
-          />
+        <%!-- `md` gives the card six columns; the first row must fill them.
+              The bucket is a time-dimension control — hour or day — so it
+              reads next to the from/to bounds that it qualifies, and the row
+              closes at six columns. --%>
+        <div class="md:col-span-3">
+          <.search id="analysis" field={@form[:search]} />
         </div>
-        <.bound id="analysis" bound={:from} field={@form[:from]} label="From (UTC)" />
-        <.bound id="analysis" bound={:to} field={@form[:to]} label="To (UTC)" />
+        <.bound
+          id="analysis"
+          bound={:from}
+          field={@form[:from]}
+          label="From (UTC)"
+          wrapper_class="flex flex-col gap-1 md:col-span-1"
+        />
+        <.bound
+          id="analysis"
+          bound={:to}
+          field={@form[:to]}
+          label="To (UTC)"
+          wrapper_class="flex flex-col gap-1 md:col-span-1"
+        />
+        <div class="md:col-span-1">
+          <.input field={@form[:bucket]} label="Bucket" type="select" options={["hour", "day"]} />
+        </div>
         <%!-- Single level selector: toggle badges through the `level` URL param.
               Full-width row so wrapping grows the card instead of overlapping
               neighbouring inputs. An empty set (or `all`) applies no predicate. --%>
-        <div
-          id="analysis-level-options"
+        <.level_options
+          id="analysis"
+          selected={@levels_selected}
+          mode={:multi}
+          toggle_event="select-level"
           class="flex flex-wrap items-center gap-2 text-sm md:col-span-6"
-          role="group"
-          aria-label="Level filter"
-        >
-          <span class="text-base-content/70">Level:</span>
-          <button
-            :for={level <- Filter.levels()}
-            type="button"
-            id={"analysis-level-#{level}"}
-            phx-click="select-level"
-            phx-value-level={level}
-            data-level={level}
-            aria-pressed={to_string(Filter.level_active?(@levels_selected, level))}
-            class={[
-              "badge cursor-pointer border uppercase",
-              Filter.level_active?(@levels_selected, level) && "badge-primary",
-              !Filter.level_active?(@levels_selected, level) &&
-                "badge-outline badge-ghost hover:badge-primary"
-            ]}
-          >
-            {level}
-          </button>
-        </div>
-        <div class="md:col-span-2">
-          <.input field={@form[:bucket]} label="Bucket" type="select" options={["hour", "day"]} />
-        </div>
+        />
         <div class="md:col-span-6 flex flex-wrap items-center justify-between gap-2">
           <div class="flex gap-2">
             <button
@@ -509,36 +536,92 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
       <% end %>
 
       <p class="text-xs text-base-content/70" id="analysis-limit">
-        Computed over at most {@applied_limit} rows per query. Increase only within the configured max.
+        Computed over at most {@applied_limit} rows per query.
       </p>
 
-      <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
-        <div class="rounded-xl border border-base-300 bg-base-100 p-4">
-          <h2 class="text-lg font-semibold tracking-tight">By level</h2>
-          <canvas
-            id="analysis-chart-level"
-            data-chart={if @charts[:level], do: Jason.encode!(@charts[:level]), else: "{}"}
-            phx-hook=".LogChart"
-            phx-update="ignore"
-          />
+      <%!-- The three breakdowns sit in one grid, ordered by level, by node,
+      then volume over time — so grid placement follows DOM order and no
+      order-* classes are needed. From `md` upward the spans place all three
+      over both wide templates: across six columns the frequency breakdowns
+      take 3 of 6 each and the time series the full row, while across the
+      twelve columns `xl` widens the grid to they take 3 of 12 each and the
+      time series 6 — twice their share, which is where the readability of a
+      week of hourly labels actually is. --%>
+      <div
+        id="analysis-breakdowns"
+        class="grid grid-cols-1 gap-4 md:grid-cols-6 xl:grid-cols-12"
+      >
+        <div
+          class="rounded-xl border border-base-300 bg-base-100 p-4 md:col-span-3"
+          id="analysis-breakdown-level"
+        >
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <h2 class="text-lg font-semibold tracking-tight">By level</h2>
+            <.chart_style
+              id="analysis-chart-level-style"
+              breakdown={:level}
+              style={@chart_styles[:level]}
+            />
+          </div>
+          <div class="relative mt-2 h-56">
+            <canvas
+              id="analysis-chart-level"
+              class="block h-full w-full"
+              data-chart={if @charts[:level], do: Jason.encode!(@charts[:level]), else: "{}"}
+              phx-hook=".LogChart"
+              phx-update="ignore"
+            />
+          </div>
           <.result_table id="analysis-levels" label_header="Level" result={@levels} />
         </div>
 
-        <div class="rounded-xl border border-base-300 bg-base-100 p-4">
-          <h2 class="text-lg font-semibold tracking-tight">Volume over time</h2>
-          <canvas
-            id="analysis-chart-volume"
-            data-chart={if @charts[:volume], do: Jason.encode!(@charts[:volume]), else: "{}"}
-            phx-hook=".LogChart"
-            phx-update="ignore"
-          />
+        <div
+          class="rounded-xl border border-base-300 bg-base-100 p-4 md:col-span-3"
+          id="analysis-breakdown-node"
+        >
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <h2 class="text-lg font-semibold tracking-tight">By node</h2>
+            <.chart_style
+              id="analysis-chart-node-style"
+              breakdown={:node}
+              style={@chart_styles[:node]}
+            />
+          </div>
+          <div class="relative mt-2 h-56">
+            <canvas
+              id="analysis-chart-node"
+              class="block h-full w-full"
+              data-chart={if @charts[:node], do: Jason.encode!(@charts[:node]), else: "{}"}
+              phx-hook=".LogChart"
+              phx-update="ignore"
+            />
+          </div>
+          <.result_table id="analysis-nodes" label_header="Node" result={@nodes} />
+        </div>
+
+        <div
+          class="rounded-xl border border-base-300 bg-base-100 p-4 md:col-span-6"
+          id="analysis-breakdown-volume"
+        >
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <h2 class="text-lg font-semibold tracking-tight">Volume over time</h2>
+            <.chart_style
+              id="analysis-chart-volume-style"
+              breakdown={:volume}
+              style={@chart_styles[:volume]}
+            />
+          </div>
+          <div class="relative mt-2 h-56">
+            <canvas
+              id="analysis-chart-volume"
+              class="block h-full w-full"
+              data-chart={if @charts[:volume], do: Jason.encode!(@charts[:volume]), else: "{}"}
+              phx-hook=".LogChart"
+              phx-update="ignore"
+            />
+          </div>
           <.result_table id="analysis-volume" label_header="Bucket" result={@volume} />
         </div>
-      </div>
-
-      <div class="rounded-xl border border-base-300 bg-base-100 p-4">
-        <h2 class="text-lg font-semibold tracking-tight">By node</h2>
-        <.result_table id="analysis-nodes" label_header="Node" result={@nodes} />
       </div>
 
       <script :type={Phoenix.LiveView.ColocatedHook} name=".LogChart">

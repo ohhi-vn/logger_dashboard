@@ -19,6 +19,48 @@ defmodule LoggerDashboardWeb.LogLiveTest do
       assert has_element?(lv, "#logs-filter-error")
     end
 
+    test "the shared filter controls are the only node, level and search controls", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/logs")
+
+      # One node control, one level control, one search control: the page
+      # offers no second, page-specific variant of any of them.
+      assert has_element?(lv, "#logs-node-options")
+      assert has_element?(lv, "#logs-level-options")
+      assert has_element?(lv, "#filters_search")
+
+      refute has_element?(lv, ~s(#logs-filter-form input[name="filters[node]"]))
+      refute has_element?(lv, "#filters_level")
+    end
+
+    test "the search control states the syntax it accepts", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/logs")
+
+      assert has_element?(lv, "#logs-search-help")
+      assert lv |> element("#logs-search-help") |> render() =~ "ignores case"
+      assert lv |> element("#logs-search-help") |> render() =~ "combined with AND"
+    end
+
+    test "the search commits on change and keeps the typed value", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/logs")
+
+      lv
+      |> form("#logs-filter-form", filters: %{search: "*boom*"})
+      |> render_change()
+
+      assert lv |> element("#filters_search") |> render() =~ "*boom*"
+    end
+
+    test "a rejected filter shows the submitted values beside the error", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/logs")
+
+      lv
+      |> form("#logs-filter-form", filters: %{search: "*boom*", from: "not-a-date"})
+      |> render_change()
+
+      assert has_element?(lv, "#logs-filter-error")
+      assert lv |> element("#filters_search") |> render() =~ "*boom*"
+    end
+
     test "a short page offers no way to advance", %{conn: conn} do
       # A node with no rows guarantees a short page regardless of what else
       # the shared ClickHouse instance holds.

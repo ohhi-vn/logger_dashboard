@@ -98,7 +98,7 @@ defmodule LoggerDashboard.Logs.PruneTest do
     refute sql =~ "message"
   end
 
-  describe "preview/1" do
+  describe "review/1" do
     setup do
       uniq = "#{System.system_time(:millisecond)}-#{:rand.uniform(1_000_000)}"
       node = "prune-preview-#{uniq}@host"
@@ -119,13 +119,17 @@ defmodule LoggerDashboard.Logs.PruneTest do
                  "from" => DateTime.to_iso8601(DateTime.add(now, -60, :minute))
                })
 
-      assert {:ok, %{count: 3, rows: sample}} = Prune.preview(filter)
+      assert {:ok, %{count: 3, rows: sample, nodes: nodes}} = Prune.review(filter)
 
       assert Enum.map(sample, & &1.message) == [
                "preview newest",
                "preview middle",
                "preview oldest"
              ]
+
+      # The per-node split is part of the blast radius: the scope holds one
+      # node, and the review says so.
+      assert nodes == [{node, 3}]
     end
 
     test "caps the sample while reporting the full count", %{node: node, now: now} do
@@ -138,7 +142,7 @@ defmodule LoggerDashboard.Logs.PruneTest do
                  "from" => DateTime.to_iso8601(DateTime.add(now, -60, :minute))
                })
 
-      assert {:ok, %{count: 7, rows: sample}} = Prune.preview(filter)
+      assert {:ok, %{count: 7, rows: sample}} = Prune.review(filter)
       assert length(sample) == 5
 
       assert Enum.map(sample, & &1.message) == [
@@ -158,7 +162,7 @@ defmodule LoggerDashboard.Logs.PruneTest do
                  "from" => "2000-01-01T00:00:00Z"
                })
 
-      assert {:ok, %{count: 0, rows: []}} = Prune.preview(filter)
+      assert {:ok, %{count: 0, rows: []}} = Prune.review(filter)
     end
   end
 

@@ -1,5 +1,22 @@
 defmodule LoggerDashboardWeb.PruneLive.Index do
-  @moduledoc "Prune logs by node or whole system with explicit confirmation."
+  @moduledoc """
+  Prune logs by node or whole system under a review the operator can read.
+
+  The page is one operation in four steps — choose the scope, set the cutoff,
+  review, confirm — presented as a single card. The steps are a
+  presentation, not a wizard: nothing is unlocked by advancing, and the
+  confirm action is reachable from wherever the operator is.
+
+  The review is the point of the page. It is computed from the scope in the
+  URL on every change, so the row count, the per-node split, and the sample
+  of rows always describe what a confirm would delete right now. That is why
+  there is no separate preview action: a count that only exists after a
+  button press is a count that can be stale, and a stale count on a delete
+  confirmation is a lie about the blast radius.
+
+  Deleting is still behind an explicit confirm action, and the delete runs
+  the same validated filter the review described.
+  """
   use LoggerDashboardWeb, :live_view
 
   alias LoggerDashboard.Logs.ClickHouseError
@@ -25,11 +42,9 @@ defmodule LoggerDashboardWeb.PruneLive.Index do
       |> assign(:prune_params, %{"scope" => "all"})
       |> assign(:node_options, [])
       |> assign(:form, to_form(%{"scope" => "all"}, as: :prune))
-      |> assign(:preview, nil)
-      |> assign(:preview_filter, nil)
-      |> assign(:preview_scope, nil)
-      |> assign(:preview_count, nil)
-      |> assign(:preview_rows, [])
+      |> assign(:review, nil)
+      |> assign(:review_filter, nil)
+      |> assign(:review_scope, nil)
       |> assign(:result, nil)
       |> assign(:error, nil)
       # Assigned here rather than only in `assign_retention/1` so every path into
@@ -42,6 +57,9 @@ defmodule LoggerDashboardWeb.PruneLive.Index do
       |> assign(:retention_stored_error, nil)
       |> assign(:retention_store_error, nil)
       |> assign(:retention_keep_options, Policy.keep_labels())
+      # Derived from the policy in force and re-derived by the retention events,
+      # so the run-at field is only ever offered for a cadence it governs.
+      |> assign(:retention_hourly?, false)
       |> assign(:retention_form, to_form(Policy.to_params(Policy.default()), as: :retention))
       |> assign_retention()
 
@@ -62,14 +80,16 @@ defmodule LoggerDashboardWeb.PruneLive.Index do
     {:noreply, apply_prune_params(socket, prune_params)}
   end
 
-  # The single path that turns URL params into page state. Any param change
-  # clears a pending preview, so a stale count can never be confirmed for a
-  # different scope, and previewing or deleting stays behind explicit actions.
+  # The single path that turns URL params into page state. Every change to
+  # the scope recomputes the review, so the count and the sample on screen
+  # always describe the scope in effect — a stale count can never be
+  # confirmed, because there is no stale count to confirm. Deleting still
+  # stays behind an explicit confirm action.
   defp apply_prune_params(socket, prune_params) do
-    # The level select always shows a value: an absent level means "all", so
-    # the form displays it rather than rendering with nothing selected. This
-    # only affects display and what the form submits — `Prune.parse/1` treats
-    # an explicit `all` exactly like an absent level.
+    # The level badges always show a value: an absent level means "all", so
+    # the control displays it rather than rendering with nothing selected.
+    # This only affects display and what the form submits — `Prune.parse/1`
+    # treats an explicit `all` exactly like an absent level.
     form_base = Map.put_new(prune_params, "level", "all")
 
     case Filter.resolve_preset(prune_params["preset"], DateTime.utc_now()) do
@@ -84,9 +104,8 @@ defmodule LoggerDashboardWeb.PruneLive.Index do
         socket
         |> assign(:prune_params, prune_params)
         |> assign(:form, to_form(form_params, as: :prune))
-        |> assign(:error, nil)
         |> load_node_options()
-        |> clear_preview()
+        |> load_review(prune_params)
 
       {:error, message} ->
         # An unrecognized cutoff is rejected outright, and no delete is
@@ -96,7 +115,7 @@ defmodule LoggerDashboardWeb.PruneLive.Index do
         |> assign(:form, to_form(form_base, as: :prune))
         |> assign(:node_options, [])
         |> assign(:error, message)
-        |> clear_preview()
+        |> clear_review()
     end
   end
 
@@ -131,18 +150,18 @@ defmodule LoggerDashboardWeb.PruneLive.Index do
     # A click selects the single-node scope for that value and then stops: it
     # replaces any previously entered node, keeps range and level, and reaches
     # no prune code at all. The patch round-trips through `handle_params`,
-    # which clears any pending preview, so a stale confirmation for another
-    # scope can never survive the click — deleting still requires an explicit
-    # preview and confirm afterwards.
+    # which recomputes the review, so a stale confirmation for another scope
+    # can never survive the click — deleting still requires an explicit
+    # confirm afterwards.
     case String.trim(to_string(node)) do
       "" ->
         {:noreply, socket}
 
-      name ->
+      _name ->
         params =
           socket.assigns.prune_params
+          |> Filter.select_node(node)
           |> Map.put("scope", "node")
-          |> Map.put("node", name)
 
         {:noreply, push_patch(socket, to: ~p"/prune?#{params}")}
     end
@@ -150,75 +169,52 @@ defmodule LoggerDashboardWeb.PruneLive.Index do
 
   @impl true
   def handle_event("select-level", %{"level" => level}, socket) do
-    # Single-select through the same `level` param the form submits. An unknown
-    # level is ignored here; hand-typed values travel the form path where
-    # `Prune.parse/1` reports them.
-    level = level |> to_string() |> String.trim() |> String.downcase()
+    # Single-select through the same `level` param the form submits, so the
+    # level the badges show and the level the delete uses are one value. An
+    # unknown level is ignored here; hand-typed values travel the form path
+    # where `Prune.parse/1` reports them.
+    params = Filter.select_level(socket.assigns.prune_params, level)
 
-    if level in Filter.levels() do
-      params = Map.put(socket.assigns.prune_params, "level", level)
-      {:noreply, push_patch(socket, to: ~p"/prune?#{params}")}
-    else
-      {:noreply, socket}
-    end
+    {:noreply, push_patch(socket, to: ~p"/prune?#{params}")}
   end
 
   @impl true
-  def handle_event("preview", params, socket) do
+  def handle_event("filter", params, socket) do
     # The form carries no node field — badges own the scope — so the submitted
-    # values merge over the URL params: the badge-selected node survives an
-    # explicit preview instead of being dropped, while anything the form does
-    # carry (bounds, level) wins. `preset` never reaches the parse, so
-    # an edited cutoff is used as typed rather than re-resolved — except the
-    # All-time mark, which survives only when the form carries no explicit
-    # bound, so typing a bound after All time yields a bounded prune while
-    # hand-cleared bounds with no mark stay rejected downstream.
-    form_attrs = prune_attrs(params)
+    # bounds merge over the URL params: the badge-selected node and level
+    # survive the edit instead of being dropped. `preset` never reaches the
+    # parse, so an edited cutoff is used as typed rather than re-resolved
+    # — except the All-time mark, which survives only when the form carries no
+    # explicit bound, so typing a bound after All time yields a bounded prune
+    # while hand-cleared bounds with no mark stay rejected downstream.
+    form_attrs = prune_form_attrs(params)
 
     attrs =
       socket.assigns.prune_params
       |> Map.merge(form_attrs)
       |> drop_preset_unless_all_time(form_attrs)
 
-    case Prune.parse(attrs) do
-      {:ok, filter, scope} ->
-        socket =
-          socket
-          |> assign(:form, to_form(attrs, as: :prune))
-          |> assign(:preview, Prune.describe(filter, scope))
-          |> assign(:preview_filter, filter)
-          |> assign(:preview_scope, scope)
-          |> assign(:result, nil)
-          |> assign(:error, nil)
-          |> load_preview(filter)
-
-        {:noreply, socket}
-
-      {:error, message} ->
-        socket =
-          socket
-          |> assign(:form, to_form(attrs, as: :prune))
-          |> assign(:preview, nil)
-          |> assign(:error, message)
-          |> assign(:result, nil)
-
-        {:noreply, socket}
-    end
+    {:noreply, push_patch(socket, to: ~p"/prune?#{attrs}")}
   end
 
   @impl true
   def handle_event("cancel", _params, socket) do
+    # Cancelling dismisses the confirmation. It deletes nothing, and the next
+    # change to the scope brings the review back.
     {:noreply,
      socket
-     |> clear_preview()
+     |> clear_review()
      |> assign(:error, nil)}
   end
 
   @impl true
   def handle_event("confirm", _params, socket) do
-    case {socket.assigns.preview_filter, socket.assigns.preview_scope} do
+    # The delete runs the filter the review described, so what is confirmed
+    # and what is deleted are the same predicate.
+    case {socket.assigns.review_filter, socket.assigns.review_scope} do
       {nil, _} ->
-        {:noreply, assign(socket, :error, "Nothing to confirm. Preview a prune first.")}
+        {:noreply,
+         assign(socket, :error, "Nothing to confirm. The review could not be computed.")}
 
       {filter, scope} ->
         case Prune.run(filter, scope) do
@@ -226,7 +222,7 @@ defmodule LoggerDashboardWeb.PruneLive.Index do
             {:noreply,
              socket
              |> assign(:result, message)
-             |> clear_preview()
+             |> clear_review()
              |> assign(:error, nil)}
 
           {:error, message} ->
@@ -247,9 +243,26 @@ defmodule LoggerDashboardWeb.PruneLive.Index do
   # hurt. That asymmetry matters more now a saved policy survives a restart — before
   # this, a restart was the way out of a policy you had second thoughts about.
 
+  # A validation-only change: the retention form re-derives its run-at field's
+  # visibility from the selected age and persists nothing. Writes stay behind
+  # `retention_apply`, and this event changes no state the scheduler can see.
+  @impl true
+  def handle_event("retention_validate", %{"retention" => attrs}, socket) do
+    keep = Map.get(attrs, "keep", "")
+
+    {:noreply, assign(socket, :retention_hourly?, Policy.keep_cadence(keep) == :hourly)}
+  end
+
   @impl true
   def handle_event("retention_apply", %{"retention" => attrs}, socket) do
-    attrs = Map.take(attrs, @retention_keys)
+    attrs = attrs |> Map.take(@retention_keys) |> carry_run_at(socket)
+
+    socket =
+      assign(
+        socket,
+        :retention_hourly?,
+        Policy.keep_cadence(Map.get(attrs, "keep", "")) == :hourly
+      )
 
     case Policy.build(attrs) do
       {:ok, %Policy{enabled: false} = policy} ->
@@ -358,6 +371,23 @@ defmodule LoggerDashboardWeb.PruneLive.Index do
     end
   end
 
+  # An hour-valued age renders no run-at field, so nothing the operator typed can
+  # arrive under that key — and letting `build/1` reset it to the default would
+  # silently replace the stored day-run time, invisible while the policy is
+  # hourly and wrong again the day they switch back. The run time in force is
+  # carried forward instead, and any submitted value is ignored: it was never a
+  # visible control for this cadence, and the schedule runs on the hour however
+  # it is set.
+  defp carry_run_at(attrs, socket) do
+    case Policy.keep_cadence(Map.get(attrs, "keep", "")) do
+      :hourly ->
+        Map.put(attrs, "run_at", Policy.to_params(socket.assigns.retention_policy)["run_at"])
+
+      :daily ->
+        attrs
+    end
+  end
+
   # The policy in force plus which layer supplied it, and the form values for it. The
   # source and both error conditions are assigns because the page has to say them: an
   # operator has to be able to tell a saved policy from a configured one, and to be
@@ -371,6 +401,7 @@ defmodule LoggerDashboardWeb.PruneLive.Index do
     |> assign(:retention_stored_error, report.stored_error)
     |> assign(:retention_store_error, report.store_error)
     |> assign(:retention_keep_options, Policy.keep_labels())
+    |> assign(:retention_hourly?, Policy.cadence(report.policy) == :hourly)
     |> assign(:retention_form, to_form(Policy.to_params(report.policy), as: :retention))
   end
 
@@ -397,10 +428,14 @@ defmodule LoggerDashboardWeb.PruneLive.Index do
   # the operator can see, so an edited cutoff is used as typed and a shortcut
   # can never re-resolve over it — `Filter.parse/1` gives a present `preset`
   # precedence, and that precedence has no business reaching a delete.
-  defp prune_attrs(%{"prune" => attrs}) when is_map(attrs),
-    do: Map.drop(attrs, ["preset"])
+  # The bounds the form carries. The scope and the level are owned by the
+  # badges, so the form contributes only the two bounds — and a blank bound
+  # is kept, because clearing a shortcut's cutoff is how the operator says
+  # the cutoff is gone.
+  defp prune_form_attrs(%{"prune" => attrs}) when is_map(attrs),
+    do: Map.take(attrs, ["from", "to"])
 
-  defp prune_attrs(attrs) when is_map(attrs), do: Map.drop(attrs, ["preset"])
+  defp prune_form_attrs(_params), do: %{}
 
   # The All-time mark is the one preset allowed through to the parse, and only
   # when the submitted form carries no explicit bound: with a typed bound the
@@ -418,29 +453,60 @@ defmodule LoggerDashboardWeb.PruneLive.Index do
   defp blank_bound?(nil), do: true
   defp blank_bound?(value), do: String.trim(to_string(value)) == ""
 
-  defp clear_preview(socket) do
-    socket
-    |> assign(:preview, nil)
-    |> assign(:preview_filter, nil)
-    |> assign(:preview_scope, nil)
-    |> assign(:preview_count, nil)
-    |> assign(:preview_rows, [])
+  # The node scope in effect: the one node the prune targets, or every node.
+  # A hand-edited URL can name a node under a whole-system scope, and the
+  # control follows the scope rather than the stray param.
+  defp selected_nodes(%{"scope" => "node", "node" => node}) when is_binary(node) and node != "",
+    do: [node]
+
+  defp selected_nodes(_prune_params), do: []
+
+  # The level scope in effect, read off the params so the control stays
+  # correct even when another filter in the same request failed validation.
+  defp selected_levels(prune_params) do
+    case Filter.parse_levels(prune_params) do
+      {:ok, levels} -> levels
+      {:error, _error} -> []
+    end
   end
 
-  # Resolve what the parsed filter would delete, into the confirmation. A read
-  # failure clears the preview and reports it instead of arming a delete whose
-  # blast radius is unknown: the count and sample are part of the confirmation,
-  # not decoration.
-  defp load_preview(socket, filter) do
-    case Prune.preview(filter) do
-      {:ok, %{count: count, rows: rows}} ->
-        assign(socket, :preview_count, count)
-        |> assign(:preview_rows, rows)
+  defp clear_review(socket) do
+    socket
+    |> assign(:review, nil)
+    |> assign(:review_filter, nil)
+    |> assign(:review_scope, nil)
+  end
 
-      {:error, error} ->
+  # Compute the review for the scope in the URL: the rows that would be
+  # deleted, how they are distributed across nodes, and a bounded sample of
+  # them. It is computed from the same validated filter the delete executes,
+  # so the numbers on screen describe exactly what a confirm would remove.
+  #
+  # A scope the pruner refuses — an unbounded one, a multi-node one — has
+  # no review to show, and the reason is shown instead. A read failure clears
+  # the review and reports it, so a destructive confirmation is never offered
+  # against a blast radius nobody could compute.
+  defp load_review(socket, prune_params) do
+    case Prune.parse(prune_params) do
+      {:ok, filter, scope} ->
+        case Prune.review(filter) do
+          {:ok, review} ->
+            socket
+            |> assign(:review, Map.put(review, :description, Prune.describe(filter, scope)))
+            |> assign(:review_filter, filter)
+            |> assign(:review_scope, scope)
+            |> assign(:error, nil)
+
+          {:error, error} ->
+            socket
+            |> clear_review()
+            |> assign(:error, ClickHouseError.friendly(error))
+        end
+
+      {:error, message} ->
         socket
-        |> clear_preview()
-        |> assign(:error, ClickHouseError.friendly(error))
+        |> clear_review()
+        |> assign(:error, message)
     end
   end
 
@@ -461,6 +527,48 @@ defmodule LoggerDashboardWeb.PruneLive.Index do
     |> DateTime.to_iso8601()
   end
 
+  # The steps the operation is presented in: choose the scope, set the
+  # cutoff, review, confirm.
+  #
+  # The steps are a presentation of one continuous operation, not a wizard:
+  # nothing is unlocked by advancing, and the confirm action is reachable
+  # from wherever the operator is. The current step follows the state — with
+  # a review on screen the operator is at the confirm step, without one they
+  # are still at the cutoff.
+  attr :id, :string, required: true
+  attr :review, :any, required: true
+
+  defp steps(assigns) do
+    reviewed = not is_nil(assigns.review)
+
+    assigns =
+      assign(assigns, :steps, [
+        %{id: "scope", label: "Choose the scope", state: :done},
+        %{id: "cutoff", label: "Set the cutoff", state: if(reviewed, do: :done, else: :current)},
+        %{id: "review", label: "Review", state: if(reviewed, do: :done, else: :pending)},
+        %{id: "confirm", label: "Confirm", state: if(reviewed, do: :current, else: :pending)}
+      ])
+
+    ~H"""
+    <ol id={@id} class="flex flex-wrap items-center gap-2 text-sm">
+      <li
+        :for={step <- @steps}
+        id={"#{@id}-#{step.id}"}
+        data-step={step.id}
+        aria-current={if step.state == :current, do: "step", else: nil}
+        class={[
+          "badge border",
+          step.state == :current && "badge-primary",
+          step.state == :done && "badge-outline badge-success",
+          step.state == :pending && "badge-outline badge-ghost text-base-content/60"
+        ]}
+      >
+        {step.label}
+      </li>
+    </ol>
+    """
+  end
+
   @impl true
   def render(assigns) do
     ~H"""
@@ -473,175 +581,144 @@ defmodule LoggerDashboardWeb.PruneLive.Index do
           </p>
         </div>
 
-        <%!-- Clickable node options, sourced from the table rather than the
-              scope in view. Badges are the only node selector: there is no
-              free-text node input. A click selects the single-node scope for
-              that value — replacing the current scope — and then stops:
-              deleting still requires an explicit preview and confirm.
-              Select-all returns to whole-system scope keeping range and
-              level. --%>
-        <div id="prune-node-options" class="flex flex-wrap items-center gap-2 text-sm">
-          <span class="text-base-content/70">Nodes:</span>
-          <button
-            :for={node <- @node_options}
-            type="button"
-            id={"prune-node-#{Base.url_encode64(node, padding: false)}"}
-            phx-click="select-node"
-            phx-value-node={node}
-            data-node={node}
-            aria-pressed={
-              to_string(@prune_params["scope"] == "node" && @prune_params["node"] == node)
-            }
-            title={"Prune single-node scope for #{node} (still requires preview and confirm)"}
-            class={[
-              "badge cursor-pointer border",
-              @prune_params["scope"] == "node" && @prune_params["node"] == node && "badge-primary",
-              (@prune_params["scope"] != "node" || @prune_params["node"] != node) &&
-                "badge-outline badge-ghost hover:badge-primary"
-            ]}
-          >
-            {node}
-          </button>
-          <button
-            type="button"
-            id="prune-select-all-nodes"
-            phx-click="select-all-nodes"
-            title="Return to whole-system scope, keeping range and level (still requires preview and confirm)"
-            class="badge cursor-pointer border badge-outline badge-ghost hover:badge-primary"
-          >
-            Select all
-          </button>
-          <span :if={@node_options == []} class="text-xs text-base-content/50">
-            No known nodes.
-          </span>
-        </div>
+        <%!-- One card holds the whole operation: the scope, the level, the
+              cutoff, the review of what would be deleted, and the actions
+              that act on them. The steps above it are a presentation of one
+              continuous operation — nothing is gated behind advancing, and
+              the confirm action is reachable from wherever the operator is. --%>
+        <section class="space-y-4 rounded-xl border border-base-300 bg-base-100 p-4" id="prune-card">
+          <.steps id="prune-steps" review={@review} />
 
-        <%!-- The scope in effect, stated rather than implied: a badge click or
-              shortcut lands here, including a node no badge offers, so the
-              confirmation below is never the first place the scope appears. --%>
-        <p id="prune-active-scope" class="text-sm text-base-content/70">
-          <%= if @prune_params["scope"] == "node" do %>
-            Single node:
-            <span class="badge badge-outline badge-primary" data-node={@prune_params["node"]}>
-              {@prune_params["node"]}
-            </span>
-          <% else %>
-            Whole system (all nodes)
-          <% end %>
-        </p>
-
-        <%!-- Clickable single-select levels through the same `level` param the
-              form submits. --%>
-        <div
-          id="prune-level-options"
-          class="flex flex-wrap items-center gap-2 text-sm"
-          role="group"
-          aria-label="Level filter"
-        >
-          <span class="text-base-content/70">Level:</span>
-          <button
-            :for={level <- Filter.levels()}
-            type="button"
-            id={"prune-level-#{level}"}
-            phx-click="select-level"
-            phx-value-level={level}
-            data-level={level}
-            aria-pressed={to_string(Map.get(@prune_params, "level", "all") == level)}
-            class={[
-              "badge cursor-pointer border uppercase",
-              Map.get(@prune_params, "level", "all") == level && "badge-primary",
-              Map.get(@prune_params, "level", "all") != level &&
-                "badge-outline badge-ghost hover:badge-primary"
-            ]}
-          >
-            {level}
-          </button>
-        </div>
-
-        <.form
-          for={@form}
-          id="prune-form"
-          phx-submit="preview"
-          class="grid grid-cols-1 gap-3 rounded-xl border border-base-300 bg-base-100 p-4 md:grid-cols-2"
-        >
-          <%!-- No scope control: the scope lives in the request params, set
-                only by the node badges (single node) and Select all (whole
-                system), and shown in the active-scope line above. --%>
-          <.bound id="prune" bound={:from} field={@form[:from]} label="From (UTC)" />
-          <.bound id="prune" bound={:to} field={@form[:to]} label="To (UTC)" />
-          <.input
-            field={@form[:level]}
-            label="Level"
-            type="select"
-            options={["all", "error", "warning", "info", "debug"]}
+          <%!-- Clickable node options, sourced from the table rather than the
+                scope in view. Badges are the only node selector: there is no
+                free-text node input. A click selects the single-node scope for
+                that value — replacing the current scope — and then stops:
+                deleting still requires an explicit confirm.
+                Select-all returns to whole-system scope keeping range and
+                level. --%>
+          <.node_options
+            id="prune"
+            options={@node_options}
+            selected={selected_nodes(@prune_params)}
+            mode={:single}
+            select_event="select-node"
+            select_all_event="select-all-nodes"
+            label="Nodes:"
           />
-          <div class="md:col-span-2">
-            <.shortcuts
-              id="prune-shortcuts"
-              family={:age}
-              active={@prune_params["preset"]}
-              label="Time range"
-            />
-          </div>
-          <div class="md:col-span-2">
-            <div class="flex flex-wrap gap-2">
-              <.button>Preview prune</.button>
-            </div>
-          </div>
-        </.form>
 
-        <%= if @error do %>
-          <p class="alert alert-error" id="prune-error">{@error}</p>
-        <% end %>
+          <%!-- The scope in effect, stated rather than implied: a badge click or
+                shortcut lands here, including a node no badge offers, so the
+                confirmation below is never the first place the scope appears. --%>
+          <p id="prune-active-scope" class="text-sm text-base-content/70">
+            <%= if @prune_params["scope"] == "node" do %>
+              Single node:
+              <span class="badge badge-outline badge-primary" data-node={@prune_params["node"]}>
+                {@prune_params["node"]}
+              </span>
+            <% else %>
+              Whole system (all nodes)
+            <% end %>
+          </p>
 
-        <%= if @preview do %>
-          <div class="space-y-3 rounded-xl border border-error/40 bg-base-100 p-4" id="prune-confirm">
-            <p class="font-semibold">Confirm prune</p>
-            <p class="text-sm" id="prune-preview-scope">This will delete logs for: {@preview}</p>
-            <%!-- The count the delete will act on, from the same validated
-                  filter, so the confirmation states the blast radius rather
-                  than only the scope text. --%>
-            <p class="text-sm font-medium" id="prune-preview-count">
-              Rows that will be deleted: {@preview_count}
-            </p>
-            <%!-- A bounded sample of the newest matching rows, so a wrong
-                  node or window is visible before confirming. Zero matching
-                  rows shows the count alone, with no sample table. --%>
-            <div :if={@preview_rows != []} id="prune-preview-rows" class="overflow-x-auto">
-              <table class="table table-xs">
-                <thead>
-                  <tr>
-                    <th>Timestamp</th>
-                    <th>Level</th>
-                    <th>Node</th>
-                    <th>Message</th>
-                    <th>Source</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr :for={row <- @preview_rows} data-role="prune-preview-row">
-                    <td class="whitespace-nowrap">{LogLine.timestamp(row)}</td>
-                    <td>{LogLine.level(row)}</td>
-                    <td>{LogLine.node_name(row)}</td>
-                    <td class="break-words whitespace-pre-wrap">{LogLine.message(row)}</td>
-                    <td>{LogLine.location(row) || "—"}</td>
-                  </tr>
-                </tbody>
-              </table>
+          <%!-- Clickable single-select levels through the same `level` param the
+                form submits. --%>
+          <.level_options
+            id="prune"
+            selected={selected_levels(@prune_params)}
+            mode={:single}
+            select_event="select-level"
+          />
+
+          <.form
+            for={@form}
+            id="prune-form"
+            phx-change="filter"
+            phx-debounce="400"
+            class="grid grid-cols-1 gap-3 md:grid-cols-2"
+          >
+            <%!-- No scope control: the scope lives in the request params, set
+                  only by the node badges (single node) and Select all (whole
+                  system), and shown in the active-scope line above. --%>
+            <.bound id="prune" bound={:from} field={@form[:from]} label="From (UTC)" />
+            <.bound id="prune" bound={:to} field={@form[:to]} label="To (UTC)" />
+            <div class="md:col-span-2">
+              <.shortcuts
+                id="prune-shortcuts"
+                family={:age}
+                active={@prune_params["preset"]}
+                label="Time range"
+              />
             </div>
-            <p class="text-xs text-base-content/70">
-              Async apply; no undo. Whole-system prunes delete every node.
-            </p>
-            <div class="flex gap-2">
-              <.button phx-click="confirm" id="prune-confirm-button" class="btn btn-error">
-                Confirm delete
-              </.button>
-              <.button phx-click="cancel" id="prune-cancel-button" class="btn btn-ghost">
-                Cancel
-              </.button>
+          </.form>
+
+          <%= if @error do %>
+            <p class="alert alert-error" id="prune-error">{@error}</p>
+          <% end %>
+
+          <%!-- The review is computed from the scope in effect, so it is never
+                stale: the count, the per-node split, and the sample all
+                describe what a confirm would delete right now. --%>
+          <%= if @review do %>
+            <div class="space-y-3 rounded-xl border border-error/40 bg-base-100 p-4" id="prune-review">
+              <p class="font-semibold">Confirm prune</p>
+              <p class="text-sm" id="prune-review-scope">
+                This will delete logs for: {@review.description}
+              </p>
+              <%!-- The count the delete will act on, from the same validated
+                    filter, so the confirmation states the blast radius rather
+                    than only the scope text. --%>
+              <p class="text-sm font-medium" id="prune-review-count">
+                Rows that would be deleted: {@review.count}
+              </p>
+              <%!-- How those rows are spread across the nodes in scope, so a
+                    whole-system prune states which nodes it takes with it. --%>
+              <div id="prune-review-nodes" class="text-sm">
+                <p class="text-xs font-medium text-base-content/60">Rows per node</p>
+                <ul class="mt-1 flex flex-wrap gap-x-3 gap-y-1">
+                  <li :for={{node, count} <- @review.nodes} data-node={node} class="font-mono text-xs">
+                    {node}: {count}
+                  </li>
+                </ul>
+              </div>
+              <%!-- A bounded sample of the newest matching rows, so a wrong
+                    node or window is visible before confirming. Zero matching
+                    rows shows the count alone, with no sample table. --%>
+              <div :if={@review.rows != []} id="prune-review-rows" class="overflow-x-auto">
+                <table class="table table-xs">
+                  <thead>
+                    <tr>
+                      <th>Timestamp</th>
+                      <th>Level</th>
+                      <th>Node</th>
+                      <th>Message</th>
+                      <th>Source</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr :for={row <- @review.rows} data-role="prune-review-row">
+                      <td class="whitespace-nowrap">{LogLine.timestamp(row)}</td>
+                      <td>{LogLine.level(row)}</td>
+                      <td>{LogLine.node_name(row)}</td>
+                      <td class="break-words whitespace-pre-wrap">{LogLine.message(row)}</td>
+                      <td>{LogLine.location(row) || "—"}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+              <p class="text-xs text-base-content/70">
+                Async apply; no undo. Whole-system prunes delete every node.
+              </p>
+              <div class="flex gap-2">
+                <.button phx-click="confirm" id="prune-confirm-button" class="btn btn-error">
+                  Confirm delete
+                </.button>
+                <.button phx-click="cancel" id="prune-cancel-button" class="btn btn-ghost">
+                  Cancel
+                </.button>
+              </div>
             </div>
-          </div>
-        <% end %>
+          <% end %>
+        </section>
 
         <%= if @result do %>
           <p class="alert alert-success" id="prune-result">{@result}</p>
@@ -655,7 +732,9 @@ defmodule LoggerDashboardWeb.PruneLive.Index do
             <div>
               <h2 class="text-lg font-semibold tracking-tight">Scheduled retention</h2>
               <p class="text-sm text-base-content/70">
-                Deletes logs older than the retained age, across every node, once a day without anyone watching.
+                Deletes logs older than the retained age, across every node, without anyone
+                watching, as often as the retained age demands — every hour for an
+                hour-valued age, once a day for a day-valued one.
               </p>
             </div>
             <.button id="retention-reset" phx-click="retention_reset" class="btn btn-ghost btn-sm">
@@ -706,6 +785,7 @@ defmodule LoggerDashboardWeb.PruneLive.Index do
           <.form
             for={@retention_form}
             id="retention-form"
+            phx-change="retention_validate"
             phx-submit="retention_apply"
             class="mt-3 grid grid-cols-1 gap-3 md:grid-cols-3"
           >
@@ -717,7 +797,11 @@ defmodule LoggerDashboardWeb.PruneLive.Index do
                 options={[{"No", "false"}, {"Yes", "true"}]}
               />
             </div>
-            <div>
+            <div :if={not @retention_hourly?}>
+              <%!-- The run time governs a day-valued age only: an hour-valued age
+                    fires on the hour, so offering a control that selects nothing
+                    would invite an operator to care about a value the schedule
+                    ignores. --%>
               <.input field={@retention_form[:run_at]} label="Run at (UTC)" placeholder="03:00 UTC" />
             </div>
             <div>

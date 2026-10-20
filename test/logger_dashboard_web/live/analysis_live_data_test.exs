@@ -287,11 +287,86 @@ defmodule LoggerDashboardWeb.AnalysisLiveDataTest do
                ~s(#analysis-node-options [data-node="#{node}"][aria-pressed="true"])
              )
 
-      assert has_element?(lv, ~s(#analysis-active-nodes [data-node="#{node}"]))
-
       lv |> element(~s(#analysis-node-options [data-node="#{node}"])) |> render_click()
 
-      assert has_element?(lv, "#analysis-active-nodes[hidden]")
+      refute has_element?(lv, ~s(#analysis-node-options [aria-pressed="true"]))
+    end
+  end
+
+  describe "result table regions" do
+    test "a breakdown with more rows than fit keeps every row inside its bounded region", %{
+      conn: conn
+    } do
+      # One row on each of many nodes, dropped on consecutive days: the
+      # by-node table and — at the day bucket — the volume table each hold
+      # more rows than the region their card allots them.
+      count = 40
+
+      nodes =
+        Enum.map(1..count, fn n ->
+          unique_node("bulk-#{String.pad_leading(Integer.to_string(n), 3, "0")}")
+        end)
+
+      now = DateTime.truncate(DateTime.utc_now(), :microsecond)
+
+      bulk =
+        Enum.zip(nodes, 1..count)
+        |> Enum.map(fn {node, day} ->
+          %{
+            id: Ash.UUID.generate(),
+            timestamp: DateTime.add(now, -day * 24 * 3600, :second),
+            level: "info",
+            message: "bulk row",
+            module: "Test",
+            file: nil,
+            line: nil,
+            function: nil,
+            metadata: %{},
+            node: node
+          }
+        end)
+
+      assert {:ok, _} = ClickhouseExLogger.Insert.insert(bulk)
+
+      # async_insert needs a moment to become queryable
+      Process.sleep(2_000)
+
+      on_exit(fn ->
+        placeholders = Enum.map_join(nodes, ",", fn _ -> "?" end)
+        ClickhouseExLogger.Repo.query("DELETE FROM logs WHERE node IN (#{placeholders})", nodes)
+      end)
+
+      {:ok, lv, _html} = live(conn, "/analysis?from=2020-01-01T00:00:00Z&bucket=day")
+
+      {:ok, filter} = LoggerDashboard.Logs.Filter.parse(%{"from" => "2020-01-01T00:00:00Z"})
+
+      {:ok, node_result} = Analysis.node_frequency(filter, limit: 1_000)
+
+      {:ok, volume_result} =
+        Analysis.volume_over_time(filter, :day, limit: 1_000, split_by_level: true)
+
+      node_rows = rendered_rows(lv, "#analysis-nodes")
+      volume_rows = rendered_rows(lv, "#analysis-volume")
+
+      # The region bounds the page, not the rows: every row the breakdowns
+      # produced is in the table, and the overflow really happened.
+      assert length(node_rows) == length(node_result.labels)
+      assert length(volume_rows) == length(volume_result.labels)
+      assert length(node_rows) >= count
+      assert length(volume_rows) >= count
+
+      # Both tables are children of the bounded, scrolling region, so the page
+      # does not grow to the row count — the region scrolls, with the header
+      # row pinned inside it.
+      assert has_element?(
+               lv,
+               ~s(div.max-h-64.overflow-auto > #analysis-nodes.table-xs.table-pin-rows)
+             )
+
+      assert has_element?(
+               lv,
+               ~s(div.max-h-64.overflow-auto > #analysis-volume.table-xs.table-pin-rows)
+             )
     end
   end
 
