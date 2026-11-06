@@ -45,3 +45,5 @@ npm-debug.log
 .dexter.db*
 /task_config
 .elixir_ls
+
+logger_dashboard_image_*.tar
