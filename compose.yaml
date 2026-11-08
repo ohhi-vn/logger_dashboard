@@ -79,10 +79,10 @@ services:
     environment:
       SECRET_KEY_BASE: ${SECRET_KEY_BASE:?set SECRET_KEY_BASE in .env - generate with mix phx.gen.secret}
       DASHBOARD_AUTH_TOKEN: ${DASHBOARD_AUTH_TOKEN:?set DASHBOARD_AUTH_TOKEN in .env - generate with mix logger_dashboard.gen.token}
-      PHX_HOST: ${PHX_HOST:-localhost}
+      LOGGER_DASHBOARD_PHX_HOST: ${DASHBOARD_HOST:-localhost}
       # Same var drives the release listen port and both sides of the publish
       # below, so host and container stay literally equal for every override.
-      DASHBOARD_PORT: ${DASHBOARD_PORT:-5051}
+      LOGGER_DASHBOARD_PORT: ${DASHBOARD_PORT:-5051}
       # The dashboard authenticates from the URL's userinfo, which
       # `config/runtime.exs` builds from these three values (percent-encoding
       # them, and preserving a `CLICKHOUSE_URL` that already carries userinfo

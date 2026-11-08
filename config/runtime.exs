@@ -104,7 +104,8 @@ if config_env() == :prod do
       You can generate one by calling: mix phx.gen.secret
       """
 
-  host = System.get_env("PHX_HOST") || "example.com"
+  host = System.get_env("LOGGER_DASHBOARD_PHX_HOST") || "localhost"
+  port = String.to_integer(System.get_env("LOGGER_DASHBOARD_PHX_HTTP_PORT") || "5051")
 
   config :logger_dashboard, :dns_cluster_query, System.get_env("DNS_CLUSTER_QUERY")
 
@@ -141,13 +142,10 @@ if config_env() == :prod do
     ]
 
   config :logger_dashboard, LoggerDashboardWeb.Endpoint,
-    url: [host: host, port: 443, scheme: "https"],
+    url: [host: host, port: port, scheme: "http"],
     http: [
-      # Enable IPv6 and bind on all interfaces.
-      # Set it to  {0, 0, 0, 0, 0, 0, 0, 1} for local network only access.
-      # See the documentation on https://bandit.hexdocs.pm/Bandit.html#t:options/0
-      # for details about using IPv6 vs IPv4 and loopback vs public addresses.
-      ip: {0, 0, 0, 0, 0, 0, 0, 0}
+      ip: {0, 0, 0, 0},
+      port: port
     ],
     # The compose stack publishes the dashboard on loopback and documents both
     # `http://localhost:<port>` and `http://127.0.0.1:<port>` as entry points
