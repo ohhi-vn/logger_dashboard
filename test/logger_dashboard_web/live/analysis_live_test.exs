@@ -638,6 +638,7 @@ defmodule LoggerDashboardWeb.AnalysisLiveTest do
       # viewport, and the bucket sits with the controls it qualifies.
       assert rows == [
                "md:col-span-3",
+               "md:col-span-3",
                "flex flex-col gap-1 md:col-span-1",
                "flex flex-col gap-1 md:col-span-1",
                "md:col-span-1",

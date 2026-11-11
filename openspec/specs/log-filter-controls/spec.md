@@ -8,7 +8,13 @@ Gives the Logs, Analysis, and Prune pages one vocabulary of filter controls — 
 
 ### Requirement: One filter control vocabulary across pages
 
-The Logs, Analysis, and Prune pages SHALL present their node scope, level scope, and message search through the same shared controls, drawn from the same level vocabulary and the same known-node list together with every node in the active scope, and SHALL mark the active selection the same way on every page. A control learned on one page SHALL be recognizable on the others and SHALL behave the same way there.
+The Logs, Analysis, and Prune pages SHALL present their node scope, level scope,
+message search, and message exclusion through the same shared controls, drawn
+from the same level vocabulary and the same known-node list together with every
+node in the active scope, and SHALL mark the active selection the same way on
+every page. A control learned on one page SHALL be recognizable on the others
+and SHALL behave the same way there. The Prune page SHALL offer no search or
+exclude control, because a prune does not filter by message.
 
 #### Scenario: The same control set appears on every page
 - **WHEN** user views the node scope, level scope, and search controls on the Logs, Analysis, and Prune pages
@@ -52,7 +58,12 @@ The node scope and level scope controls SHALL support a multi-select mode, in wh
 
 ### Requirement: The search control states the matching syntax
 
-The message search control SHALL state the syntax it accepts: `*` matches any run of characters, `?` matches a single character, a term with no wildcard matches anywhere in the message, matching ignores letter case, and space-separated terms are combined with AND. Every page that offers a search control SHALL state the same syntax, and a page that cannot filter by message SHALL offer no search control.
+The message search and message exclusion controls SHALL state the syntax they
+accept: `*` matches any run of characters, `?` matches a single character, a
+term with no wildcard matches anywhere in the message, matching ignores letter
+case, and space-separated terms are combined with AND. Every page that offers a
+search or exclude control SHALL state the same syntax, and a page that cannot
+filter by message SHALL offer no such control.
 
 #### Scenario: The syntax is stated where the search is entered
 - **WHEN** user views the search control
@@ -65,6 +76,11 @@ The message search control SHALL state the syntax it accepts: `*` matches any ru
 #### Scenario: A page that cannot filter by message offers no search control
 - **WHEN** user views the Prune page
 - **THEN** no search control is offered, because a prune does not filter by message
+
+#### Scenario: The syntax is stated where the exclude is entered
+- **WHEN** user views the exclude control
+- **THEN** the control states the wildcard characters, the case-insensitivity,
+  and the AND combination of separate terms
 
 ### Requirement: Filter controls show the values in effect
 

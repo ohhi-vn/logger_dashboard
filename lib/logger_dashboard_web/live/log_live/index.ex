@@ -6,13 +6,11 @@ defmodule LoggerDashboardWeb.LogLive.Index do
   alias LoggerDashboard.Logs.Filter
   alias LoggerDashboard.Logs.LogLine
   alias LoggerDashboard.Logs.LogRead
-
-  @filter_keys ["node", "search", "from", "to", "preset", "level", "limit", "offset"]
-
+  alias LoggerDashboard.Logs.Prune
+  @filter_keys ["node", "search", "exclude", "from", "to", "preset", "level", "limit", "offset"]
   # A name that identifies the file as a log export rather than the page it came
   # from, which the browser would otherwise derive from the title.
-  @export_filename "logs-export.txt"
-
+  @export_filename "logs-export.csv"
   @impl true
   def mount(_params, _session, socket) do
     socket =
@@ -28,8 +26,14 @@ defmodule LoggerDashboardWeb.LogLive.Index do
       |> assign(:limit, Filter.default_limit())
       |> assign(:offset, 0)
       |> assign(:expanded_ids, MapSet.new())
+      |> assign(:selected_ids, MapSet.new())
       |> assign(:page_rows, [])
       |> assign(:node_options, [])
+      |> assign(:prune_review, nil)
+      |> assign(:prune_scope, nil)
+      |> assign(:prune_filter, nil)
+      |> assign(:prune_error, nil)
+      |> assign(:prune_result, nil)
       |> stream_configure(:logs, dom_id: &row_dom_id/1)
       |> stream(:logs, [])
 
@@ -48,7 +52,15 @@ defmodule LoggerDashboardWeb.LogLive.Index do
   # filter set. Expansion is page-local, so any new filter set starts
   # collapsed.
   defp apply_filter_params(socket, filter_params) do
-    socket = assign(socket, :expanded_ids, MapSet.new())
+    socket =
+      socket
+      |> assign(:expanded_ids, MapSet.new())
+      |> assign(:selected_ids, MapSet.new())
+      |> assign(:prune_review, nil)
+      |> assign(:prune_scope, nil)
+      |> assign(:prune_filter, nil)
+      |> assign(:prune_error, nil)
+      |> assign(:prune_result, nil)
 
     case Filter.parse(filter_params) do
       {:ok, filter} ->
@@ -265,14 +277,122 @@ defmodule LoggerDashboardWeb.LogLive.Index do
     # The rows are the ones already on the page, read back from the page's own
     # row list rather than re-queried, so the file cannot disagree with the
     # screen or cost a second round trip for a page that can hold 3000 rows.
-    body = LogLine.format_page(socket.assigns.page_rows)
+    # When rows are selected, only those are exported; otherwise the whole page.
+    rows =
+      selected_rows(socket.assigns.page_rows, socket.assigns.selected_ids)
+
+    body = LogLine.csv_page(rows)
 
     {:noreply,
      push_event(socket, "logs-download", %{
        body: body,
        filename: @export_filename,
-       content_type: "text/plain; charset=utf-8"
+       content_type: "text/csv; charset=utf-8"
      })}
+  end
+
+  @impl true
+  def handle_event("toggle-select", %{"id" => dom_id}, socket) do
+    selected_ids =
+      if MapSet.member?(socket.assigns.selected_ids, dom_id) do
+        MapSet.delete(socket.assigns.selected_ids, dom_id)
+      else
+        MapSet.put(socket.assigns.selected_ids, dom_id)
+      end
+
+    {:noreply, assign(socket, :selected_ids, selected_ids)}
+  end
+
+  @impl true
+  def handle_event("select-all-rows", _params, socket) do
+    ids = MapSet.new(socket.assigns.page_rows, &row_dom_id/1)
+
+    selected_ids =
+      if socket.assigns.selected_ids == ids and ids != MapSet.new() do
+        MapSet.new()
+      else
+        ids
+      end
+
+    {:noreply, assign(socket, :selected_ids, selected_ids)}
+  end
+
+  @impl true
+  def handle_event("prune", _params, socket) do
+    filter = socket.assigns.filter
+
+    prune_params = %{
+      "scope" => if(length(filter.nodes) == 1, do: "node", else: "all"),
+      "node" => if(length(filter.nodes) == 1, do: hd(filter.nodes), else: ""),
+      "from" => if(filter.from, do: DateTime.to_iso8601(filter.from), else: ""),
+      "to" => if(filter.to, do: DateTime.to_iso8601(filter.to), else: ""),
+      "level" => Filter.levels_to_param(filter.levels),
+      "preset" => filter.preset
+    }
+
+    case Prune.parse(prune_params) do
+      {:ok, parsed_filter, scope} ->
+        case Prune.review(parsed_filter) do
+          {:ok, review} ->
+            {:noreply,
+             socket
+             |> assign(:prune_review, review)
+             |> assign(:prune_scope, scope)
+             |> assign(:prune_filter, parsed_filter)
+             |> assign(:prune_error, nil)}
+
+          {:error, error} ->
+            {:noreply,
+             socket
+             |> assign(:prune_review, nil)
+             |> assign(:prune_error, ClickHouseError.friendly(error))}
+        end
+
+      {:error, message} ->
+        {:noreply,
+         socket
+         |> assign(:prune_review, nil)
+         |> assign(:prune_error, message)}
+    end
+  end
+
+  @impl true
+  def handle_event("confirm-prune", _params, socket) do
+    case socket.assigns.prune_review do
+      nil ->
+        {:noreply, socket}
+
+      _review ->
+        filter = socket.assigns.prune_filter
+        scope = socket.assigns.prune_scope
+
+        case Prune.run(filter, scope) do
+          {:ok, message} ->
+            {:noreply,
+             socket
+             |> assign(:prune_result, message)
+             |> assign(:prune_review, nil)
+             |> apply_filter_params(socket.assigns.filter_params)}
+
+          {:error, message} ->
+            {:noreply, assign(socket, :prune_error, message)}
+        end
+    end
+  end
+
+  @impl true
+  def handle_event("cancel-prune", _params, socket) do
+    {:noreply,
+     socket
+     |> assign(:prune_review, nil)
+     |> assign(:prune_error, nil)
+     |> assign(:prune_result, nil)}
+  end
+
+  defp selected_rows(page_rows, selected_ids) do
+    selected = Enum.filter(page_rows, &MapSet.member?(selected_ids, row_dom_id(&1)))
+
+    if selected == [], do: page_rows, else: selected
   end
 
   defp toggle_member(set, value) do
@@ -343,7 +463,7 @@ defmodule LoggerDashboardWeb.LogLive.Index do
   defp analysis_params(%Filter{} = filter) do
     filter
     |> Filter.to_params()
-    |> Map.take(["node", "search", "from", "to", "preset", "level"])
+    |> Map.take(["node", "search", "exclude", "from", "to", "preset", "level"])
     |> Enum.reject(fn {_key, value} -> value in [nil, ""] end)
     |> Map.new()
   end
@@ -472,8 +592,11 @@ defmodule LoggerDashboardWeb.LogLive.Index do
         phx-debounce="400"
         class="grid grid-cols-1 gap-3 rounded-xl border border-base-300 bg-base-100 p-4 md:grid-cols-6"
       >
-        <div class="md:col-span-4">
+        <div class="md:col-span-3">
           <.search id="logs" field={@form[:search]} />
+        </div>
+        <div class="md:col-span-3">
+          <.search id="logs-exclude" field={@form[:exclude]} label="Exclude" placeholder="*debug*" />
         </div>
         <.bound id="logs" bound={:from} field={@form[:from]} label="From (UTC)" />
         <.bound id="logs" bound={:to} field={@form[:to]} label="To (UTC)" />
@@ -634,6 +757,17 @@ defmodule LoggerDashboardWeb.LogLive.Index do
             </span>
 
             <span class="flex shrink-0 items-center gap-0.5">
+              <%!-- Row selection for the CSV export. --%>
+              <input
+                type="checkbox"
+                id={"logs-select-#{dom_id}"}
+                checked={MapSet.member?(@selected_ids, dom_id)}
+                phx-click="toggle-select"
+                phx-value-id={dom_id}
+                class="checkbox checkbox-xs"
+                aria-label="Select row for export"
+              />
+
               <%!-- Copies the row's export line — timestamp, level, node,
                   untruncated message, location — so copy and export agree. --%>
               <button
@@ -688,6 +822,44 @@ defmodule LoggerDashboardWeb.LogLive.Index do
         </div>
       </div>
 
+      <%= if @prune_review || @prune_error || @prune_result do %>
+        <div id="logs-prune-panel" class="rounded-xl border border-base-300 bg-base-100 p-4">
+          <%= if @prune_error do %>
+            <p class="alert alert-error" id="logs-prune-error">{@prune_error}</p>
+          <% end %>
+          <%= if @prune_result do %>
+            <p class="alert alert-success" id="logs-prune-result">{@prune_result}</p>
+          <% end %>
+          <%= if @prune_review do %>
+            <p class="text-sm font-medium">Short prune review</p>
+            <p class="text-sm text-base-content/70">
+              Rows to delete: {@prune_review.count}
+            </p>
+            <ul class="text-sm text-base-content/70">
+              <li :for={{node, count} <- @prune_review.nodes}>{node}: {count}</li>
+            </ul>
+            <div class="mt-2 flex gap-2">
+              <button
+                type="button"
+                id="logs-prune-confirm"
+                phx-click="confirm-prune"
+                class="btn btn-error btn-sm"
+              >
+                Confirm prune
+              </button>
+              <button
+                type="button"
+                id="logs-prune-cancel"
+                phx-click="cancel-prune"
+                class="btn btn-ghost btn-sm"
+              >
+                Cancel
+              </button>
+            </div>
+          <% end %>
+        </div>
+      <% end %>
+
       <div id="logs-pagination" class="flex flex-wrap items-center gap-3">
         <.button id="logs-prev" phx-click="prev" disabled={@offset == 0}>Previous</.button>
         <%!-- The count for the whole filtered result, not just this page.
@@ -719,10 +891,26 @@ defmodule LoggerDashboardWeb.LogLive.Index do
         >
           Collapse all
         </button>
+        <button
+          type="button"
+          id="logs-select-all"
+          phx-click="select-all-rows"
+          class="btn btn-ghost btn-sm"
+        >
+          Select all on page
+        </button>
+        <button
+          type="button"
+          id="logs-prune"
+          phx-click="prune"
+          class="btn btn-error btn-soft btn-sm"
+        >
+          <.icon name="hero-trash" class="size-4" /> Prune current filter
+        </button>
         <.button
           id="logs-export"
           phx-click="export"
-          title="Download this page's rows as plain text"
+          title="Download this page's rows as CSV"
           class="btn btn-ghost btn-sm"
         >
           <.icon name="hero-arrow-down-tray" class="size-4" /> Export page

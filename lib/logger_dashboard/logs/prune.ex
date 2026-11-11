@@ -56,6 +56,8 @@ defmodule LoggerDashboard.Logs.Prune do
           |> Map.put("node", if(scope == "node", do: node, else: ""))
           |> Map.delete("search")
           |> Map.delete(:search)
+          |> Map.delete("exclude")
+          |> Map.delete(:exclude)
 
         with {:ok, filter} <- Filter.parse(normalized),
              :ok <- require_bounds(filter) do

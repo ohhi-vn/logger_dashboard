@@ -102,6 +102,7 @@ defmodule LoggerDashboard.Logs.Filter do
 
   defstruct nodes: [],
             search: "",
+            exclude: "",
             from: nil,
             to: nil,
             preset: nil,
@@ -126,6 +127,7 @@ defmodule LoggerDashboard.Logs.Filter do
     nodes = parse_nodes(params)
 
     with {:ok, search} <- parse_search(params),
+         {:ok, exclude} <- parse_exclude(params),
          {:ok, preset} <- parse_preset(params),
          {:ok, {from, to}} <- parse_range(params, preset),
          {:ok, levels} <- parse_levels(params),
@@ -134,6 +136,7 @@ defmodule LoggerDashboard.Logs.Filter do
        %__MODULE__{
          nodes: nodes,
          search: search,
+         exclude: exclude,
          from: from,
          to: to,
          preset: preset,
@@ -248,6 +251,7 @@ defmodule LoggerDashboard.Logs.Filter do
     %{
       "node" => nodes_to_param(filter.nodes),
       "search" => filter.search,
+      "exclude" => filter.exclude,
       "from" => iso8601(filter.from),
       "to" => iso8601(filter.to),
       "level" => levels_to_param(filter.levels),
@@ -427,6 +431,7 @@ defmodule LoggerDashboard.Logs.Filter do
         else: {clauses, params}
 
     {clauses, params} = push_search(clauses, params, filter.search)
+    {clauses, params} = push_exclude(clauses, params, filter.exclude)
 
     case Enum.reverse(clauses) do
       [] -> {"1 = 1", []}
@@ -443,6 +448,25 @@ defmodule LoggerDashboard.Logs.Filter do
     |> Enum.reduce({clauses, params}, fn pattern, {clauses, params} ->
       maybe_push(clauses, params, "message ILIKE ?", pattern)
     end)
+  end
+
+  # One clause for the whole exclude pattern: a row is removed only when it
+  # matches every term, mirroring `push_search/3`. A single term becomes a
+  # plain `NOT ILIKE`; several terms become `NOT (ILIKE AND ILIKE AND ...)`.
+  defp push_exclude(clauses, params, exclude) do
+    case search_patterns(exclude) do
+      [] ->
+        {clauses, params}
+
+      [pattern] ->
+        maybe_push(clauses, params, "message NOT ILIKE ?", pattern)
+
+      patterns ->
+        clause =
+          "NOT (" <> Enum.map_join(patterns, " AND ", fn _ -> "message ILIKE ?" end) <> ")"
+
+        {[clause | clauses], Enum.reverse(patterns) ++ params}
+    end
   end
 
   defp maybe_push_nodes(clauses, params, []), do: {clauses, params}
@@ -530,6 +554,10 @@ defmodule LoggerDashboard.Logs.Filter do
 
   defp parse_search(params) do
     {:ok, get(params, "search", "") |> to_string()}
+  end
+
+  defp parse_exclude(params) do
+    {:ok, get(params, "exclude", "") |> to_string()}
   end
 
   @doc """

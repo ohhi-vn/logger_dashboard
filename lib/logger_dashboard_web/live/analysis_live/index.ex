@@ -10,6 +10,7 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
   @filter_keys [
     "node",
     "search",
+    "exclude",
     "from",
     "to",
     "preset",
@@ -476,6 +477,14 @@ defmodule LoggerDashboardWeb.AnalysisLive.Index do
               closes at six columns. --%>
         <div class="md:col-span-3">
           <.search id="analysis" field={@form[:search]} />
+        </div>
+        <div class="md:col-span-3">
+          <.search
+            id="analysis-exclude"
+            field={@form[:exclude]}
+            label="Exclude"
+            placeholder="*debug*"
+          />
         </div>
         <.bound
           id="analysis"

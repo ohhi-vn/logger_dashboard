@@ -826,18 +826,24 @@ defmodule LoggerDashboardWeb.LogLiveTest do
 
       assert_push_event(lv, "logs-download", %{
         body: body,
-        filename: "logs-export.txt",
-        content_type: "text/plain; charset=utf-8"
+        filename: "logs-export.csv",
+        content_type: "text/csv; charset=utf-8"
       })
 
       lines = String.split(body, "\n")
 
-      assert length(lines) == 2
+      assert length(lines) == 3
 
       assert Enum.at(lines, 0) ==
-               "2026-06-01 14:00:00 UTC error #{tag} export newest #{tag} Test.Module.run/1 lib/test.ex:42"
+               "timestamp,level,node,message,module,function,file,line,metadata"
 
-      assert Enum.at(lines, 1) == "2026-06-01 13:00:00 UTC warning #{tag} export middle #{tag}"
+      assert Enum.at(lines, 1) =~
+               "2026-06-01 14:00:00 UTC,error,#{tag},export newest #{tag},Test.Module,run/1,lib/test.ex,42,"
+
+      assert Enum.at(lines, 1) =~ "user_id"
+
+      assert Enum.at(lines, 2) ==
+               "2026-06-01 13:00:00 UTC,warning,#{tag},export middle #{tag},,,,,"
     end
 
     test "the export covers exactly the current page", %{conn: conn, tag: tag} do
@@ -876,10 +882,10 @@ defmodule LoggerDashboardWeb.LogLiveTest do
 
       assert_push_event(lv, "logs-download", %{body: body})
 
-      # The module-only source location rides along; the missing node does not
-      # leave an empty field behind.
-      assert body ==
-               "2026-06-01 12:00:00 UTC info unknown export oldest\\nwith newline #{tag} Test"
+      # The module-only source location rides along; the missing node exports
+      # the placeholder. The multi-line message is quoted as one CSV field.
+      assert body =~ "2026-06-01 12:00:00 UTC,info,unknown,"
+      assert body =~ "export oldest"
     end
 
     test "a message shortened on screen exports whole", %{conn: conn, tag: tag} do
@@ -1011,7 +1017,7 @@ defmodule LoggerDashboardWeb.LogLiveTest do
 
       assert_push_event(lv, "logs-download", %{body: body})
 
-      assert body |> String.split("\n") |> length() == 3
+      assert body |> String.split("\n") |> length() == 4
       refute body =~ "logpage row 001"
     end
   end
@@ -1031,7 +1037,11 @@ defmodule LoggerDashboardWeb.LogLiveTest do
       }
 
       lv |> element("#logs-export") |> render_click()
-      assert_push_event(lv, "logs-download", %{body: "", filename: "logs-export.txt"})
+
+      assert_push_event(lv, "logs-download", %{
+        body: "timestamp,level,node,message,module,function,file,line,metadata",
+        filename: "logs-export.csv"
+      })
 
       assert {
                lv |> element("#logs-filter-form") |> render(),

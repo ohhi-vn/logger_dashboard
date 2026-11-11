@@ -7,7 +7,8 @@ Gives operators system-wide and per-node log analytics (volume, level mix, node 
 ## Requirements
 
 ### Requirement: System or node analysis scope
-The system SHALL compute analytics scoped to all nodes, one node, or multiple nodes, reusing the viewer filter semantics for `node`, datetime range, level, and `search` keyword. It SHALL present the known nodes only as clickable badge options with no node text input, plus select-all and clear actions returning to all nodes, and clicking an option SHALL toggle that node in or out of the active scope without disturbing the other active filters. It SHALL present each level as a clickable toggle option plus an `all` reset option, and clicking a level option SHALL toggle that level in or out of the active level set without disturbing the other active filters. An empty level set, or selecting `all`, SHALL apply no level predicate; a non-empty level set SHALL aggregate only rows whose `level` equals any selected value. The `level` URL param SHALL accept a comma-separated list (e.g. `level=error,warning`); a single value, `all`, absent, or blank SHALL keep working as a one-element or empty set, and an unknown level value SHALL reject the filter with a validation error and run no analysis. It SHALL accept a `search` keyword using the same wildcard syntax as the viewer (`*` = any run, `?` = single char) and SHALL apply it as a database-evaluated predicate over `message` together with the node, range, and level predicates. An empty or absent `search` SHALL apply no message predicate. The system SHALL accept handoff params (`node`, `search`, `from`, `to`, `level`, `bucket`) navigated from the Logs page and SHALL treat them identically to hand-entered values, including a multi-level `level` value.
+
+The system SHALL compute analytics scoped to all nodes, one node, or multiple nodes, reusing the viewer filter semantics for `node`, datetime range, level, `search` keyword, and `exclude` keyword. It SHALL present the known nodes only as clickable badge options with no node text input, plus select-all and clear actions returning to all nodes, and clicking an option SHALL toggle that node in or out of the active scope without disturbing the other active filters. It SHALL present each level as a clickable toggle option plus an `all` reset option, and clicking a level option SHALL toggle that level in or out of the active level set without disturbing the other active filters. An empty level set, or selecting `all`, SHALL apply no level predicate; a non-empty level set SHALL aggregate only rows whose `level` equals any selected value. The `level` URL param SHALL accept a comma-separated list (e.g. `level=error,warning`); a single value, `all`, absent, or blank SHALL keep working as a one-element or empty set, and an unknown level value SHALL reject the filter with a validation error and run no analysis. It SHALL accept a `search` keyword using the same wildcard syntax as the viewer (`*` = any run, `?` = single char) and SHALL apply it as a database-evaluated predicate over `message` together with the node, range, and level predicates. An empty or absent `search` SHALL apply no message predicate. It SHALL accept an `exclude` keyword using the same wildcard syntax and term combination as `search`, and SHALL remove from every breakdown the rows whose message matches that pattern. An empty or absent `exclude` SHALL apply no exclusion predicate. The system SHALL accept handoff params (`node`, `search`, `exclude`, `from`, `to`, `level`, `bucket`) navigated from the Logs page and SHALL treat them identically to hand-entered values, including a multi-level `level` value.
 
 #### Scenario: Analyze whole system
 - **WHEN** user opens analysis with no node selected
@@ -400,3 +401,25 @@ The Analysis page SHALL state the active node scope through the node scope contr
 
 - **WHEN** user views the Analysis page with nodes in scope
 - **THEN** each of those nodes is offered by the node options and marked as in scope
+
+### Requirement: Analysis message exclusion semantics
+
+The Analysis page's exclude scope SHALL remove messages with the same semantics the Logs page uses: terms matched without regard to letter case, with several space-separated terms combined with AND, and a term without a wildcard matching anywhere in the message. Every breakdown — by level, volume over time, and by node — SHALL count only rows that do not match the exclude pattern, and an empty exclude SHALL apply no exclusion predicate.
+
+#### Scenario: Exclusion ignores letter case
+
+- **WHEN** user enters `Health` in exclude and a row's message reads
+  `Health check ok`
+- **THEN** that row is omitted from the level, volume, and node breakdowns
+
+#### Scenario: Several exclude terms narrow every breakdown
+
+- **WHEN** user enters `*health* *ok*` in exclude
+- **THEN** the level, volume, and node breakdowns each omit only rows whose
+  message matches both terms
+
+#### Scenario: An empty exclude applies no exclusion predicate
+
+- **WHEN** user runs the analysis with an empty exclude value
+- **THEN** the breakdowns count every row in the scope, range, level, and
+  search set

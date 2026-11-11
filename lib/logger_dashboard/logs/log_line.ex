@@ -74,6 +74,64 @@ defmodule LoggerDashboard.Logs.LogLine do
   def format_page(rows) when is_list(rows), do: Enum.map_join(rows, "\n", &format/1)
 
   @doc """
+  The CSV header row naming the columns in order: timestamp, level, node,
+  message, module, function, file, line, metadata.
+  """
+  @spec csv_header() :: String.t()
+  def csv_header, do: "timestamp,level,node,message,module,function,file,line,metadata"
+
+  @doc """
+  One log row as a CSV record, with proper quoting. `metadata` is serialized
+  as JSON when present, and an empty value when absent.
+  """
+  @spec csv_row(map()) :: String.t()
+  def csv_row(log) when is_map(log) do
+    [
+      timestamp(log),
+      level(log),
+      node_name(log),
+      to_string(Map.get(log, :message)),
+      csv_value(Map.get(log, :module)),
+      csv_value(Map.get(log, :function)),
+      csv_value(Map.get(log, :file)),
+      csv_value(Map.get(log, :line)),
+      metadata_json(log)
+    ]
+    |> Enum.map_join(",", &csv_cell/1)
+  end
+
+  @doc """
+  The CSV body for a page of rows: the header row followed by one record per
+  row, newest first. An empty page yields the header row only.
+  """
+  @spec csv_page([map()]) :: String.t()
+  def csv_page([]), do: csv_header()
+
+  def csv_page(rows) when is_list(rows) do
+    csv_header() <> "\n" <> Enum.map_join(rows, "\n", &csv_row/1)
+  end
+
+  defp metadata_json(%{metadata: metadata}) when is_map(metadata) and map_size(metadata) > 0 do
+    case Jason.encode(metadata) do
+      {:ok, json} -> json
+      {:error, _reason} -> inspect(metadata)
+    end
+  end
+
+  defp metadata_json(_log), do: ""
+
+  defp csv_value(nil), do: ""
+  defp csv_value(value), do: to_string(value)
+
+  defp csv_cell(value) when is_binary(value) do
+    if String.contains?(value, [",", "\"", "\n", "\r"]) do
+      "\"" <> String.replace(value, "\"", "\"\"") <> "\""
+    else
+      value
+    end
+  end
+
+  @doc """
   One record as a single line of text, in the same field order as `fields/2`.
 
   This is the export's line. `opts` are `fields/2`'s; the export passes no
